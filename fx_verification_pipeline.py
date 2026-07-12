@@ -961,15 +961,16 @@ def _row_status(values: list, headers: list = None) -> str:
     return "neutral"
 
 
-def _write_sheet(wb, sheet_name: str, df: pd.DataFrame):
-    ws = wb.create_sheet(sheet_name)
+def _write_table_at(ws, start_row: int, df: pd.DataFrame) -> int:
+    """df를 start_row부터 헤더+본문으로 쓰고, 다음에 이어 쓸 수 있는 빈 행 번호를 반환.
+    이상치/부적정 행은 빨간색, 적정 행은 초록색으로 통째로 하이라이트하고 맨 위로 정렬,
+    차변금액/대변금액이 있으면 순액을 자동 추가, 금액/환율/퍼센트/날짜 열은 서식 자동 적용."""
     if df is None or df.empty:
-        ws.append(["(해당 없음)"])
-        return
+        ws.cell(row=start_row, column=1, value="(해당 없음)")
+        return start_row + 1
 
     df = df.rename(columns=COLUMN_LABELS)
 
-    # 차변금액/대변금액이 있으면 그 바로 오른쪽에 순액(차변-대변)을 자동으로 추가
     if "차변금액" in df.columns and "대변금액" in df.columns:
         debit = pd.to_numeric(df["차변금액"], errors="coerce").fillna(0)
         credit = pd.to_numeric(df["대변금액"], errors="coerce").fillna(0)
@@ -977,7 +978,6 @@ def _write_sheet(wb, sheet_name: str, df: pd.DataFrame):
         df = df.copy()
         df.insert(insert_at, "순액", debit - credit)
 
-    # 이상치/부적정 행이 위로 오도록 정렬 (같은 상태 안에서는 원래 순서 유지)
     status_list = [_row_status(row.tolist(), df.columns.tolist()) for _, row in df.iterrows()]
     order = {"flag": 0, "neutral": 1, "ok": 2}
     df = df.assign(_status=status_list).sort_values(
@@ -987,41 +987,84 @@ def _write_sheet(wb, sheet_name: str, df: pd.DataFrame):
     df = df.drop(columns="_status")
 
     headers = list(df.columns)
-    ws.append(headers)
-    for c in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=c)
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(row=start_row, column=c, value=h)
         cell.font = HEADER_FONT_XL
         cell.fill = HEADER_FILL_XL
 
     number_formats = [_column_number_format(h) for h in headers]
-
-    for row_idx, ((_, row), status) in enumerate(zip(df.iterrows(), statuses), start=2):
-        ws.append([None if pd.isna(v) else v for v in row.tolist()])
+    row_idx = start_row + 1
+    for (_, row), status in zip(df.iterrows(), statuses):
         row_fill = FLAG_FILL if status == "flag" else (OK_FILL if status == "ok" else None)
-        for c in range(1, len(headers) + 1):
-            cell = ws.cell(row=row_idx, column=c)
+        for c, val in enumerate(row.tolist(), start=1):
+            val = None if pd.isna(val) else val
+            cell = ws.cell(row=row_idx, column=c, value=val)
             cell.font = BODY_FONT_XL
             cell.border = THIN_BORDER
             if row_fill:
                 cell.fill = row_fill
-            if number_formats[c - 1] and isinstance(cell.value, (int, float, datetime, pd.Timestamp)):
+            if number_formats[c - 1] and isinstance(val, (int, float, datetime, pd.Timestamp)):
                 cell.number_format = number_formats[c - 1]
+        row_idx += 1
 
-    # 열 너비: 헤더/내용 길이 중 더 긴 쪽 기준으로 자동 설정 (최소 10, 최대 32)
-    # 한글 등 CJK 문자는 폭이 영문의 약 1.8배이므로 가중치를 둬서 계산한다.
+    return row_idx
+
+
+def _autosize_columns(ws):
+    """헤더/내용 길이 중 더 긴 쪽 기준으로 열 너비 자동 설정 (최소 10, 최대 34).
+    한글 등 CJK 문자는 폭이 영문의 약 1.8배이므로 가중치를 둬서 계산한다."""
     def _display_width(s: str) -> float:
         return sum(1.8 if ord(ch) > 0x2E80 else 1.0 for ch in s)
 
-    for c, header in enumerate(headers, start=1):
-        max_len = _display_width(str(header))
-        for r in range(2, ws.max_row + 1):
+    for c in range(1, ws.max_column + 1):
+        max_len = 0
+        for r in range(1, ws.max_row + 1):
             val = ws.cell(row=r, column=c).value
             if val is not None:
                 max_len = max(max_len, _display_width(str(val)))
         ws.column_dimensions[get_column_letter(c)].width = min(max(max_len + 2, 10), 34)
 
+
+def _write_sheet(wb, sheet_name: str, df: pd.DataFrame):
+    ws = wb.create_sheet(sheet_name)
+    _write_table_at(ws, 1, df)
+    _autosize_columns(ws)
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
+
+
+def _write_stacked_sheet(wb, sheet_name: str, tables: list):
+    """tables: [(제목, df), ...] - 성격이 비슷한 표 여러 개를 한 시트에 세로로 이어붙인다."""
+    ws = wb.create_sheet(sheet_name)
+    row = 1
+    for title, df in tables:
+        cell = ws.cell(row=row, column=1, value=title)
+        cell.font = Font(bold=True, size=12, name="Arial")
+        row += 1
+        row = _write_table_at(ws, row, df)
+        row += 2  # 표 사이 여백
+    _autosize_columns(ws)
+    ws.freeze_panes = "A1"
+
+
+def build_fx_detail_report(screened: pd.DataFrame, ref_check: pd.DataFrame,
+                            verified: pd.DataFrame) -> pd.DataFrame:
+    """1단계 스크리닝 + 기준일 불일치 탐지 + 2단계 증빙검증을, 거래ID+결제일 기준으로
+    하나의 표로 합친다. 원래 3개 시트로 나뉘어 있던 건 사실 같은 거래를 세 각도로
+    본 것뿐이라, 하나의 표에서 옆으로 이어 보는 게 오히려 대사하기 편하다."""
+    ref_check = ref_check.copy()
+    ref_check["결제일"] = pd.to_datetime(ref_check["결제일"])
+    merged = screened.merge(
+        ref_check[["거래ID", "결제일", "기준일판정", "추정사용일자"]],
+        on=["거래ID", "결제일"], how="left",
+    )
+    if verified is not None and not verified.empty:
+        verified = verified.copy()
+        verified["결제일"] = pd.to_datetime(verified["결제일"])
+        verify_extra = verified[["거래ID", "결제일", "증빙상태", "증빙확인환율", "최종판정"]]
+        merged = merged.merge(verify_extra, on=["거래ID", "결제일"], how="left")
+        merged["증빙상태"] = merged["증빙상태"].fillna("증빙검증 대상 아님(1차 스크리닝 적정 통과)")
+    return merged
 
 
 def export_results_to_excel(output_path: str, *, counterparty_summary, rate_trend,
@@ -1032,6 +1075,50 @@ def export_results_to_excel(output_path: str, *, counterparty_summary, rate_tren
     금액/환율/퍼센트 열은 각각 알맞은 서식을 자동 적용한다."""
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
+
+    SHEET_GUIDE = [
+        ("요약", "합계 중요성(AMPT) 초과 여부와 전체 판정. 제일 먼저 볼 것."),
+        ("A.표본전체상세", "검증 대상이 된 분개 원본 라인 전체(발생·결제·기말평가) + 거래별 최종 판정. "
+                          "이번에 어떤 분개들을 봤고 그중 뭐가 문제였는지 한 시트에서 확인."),
+        ("B.분석적검토", "거래처별 연간 요약 + 월별 환율 추이. 개별 거래를 보기 전에 "
+                        "이상한 거래처·시점부터 먼저 짚어내는 분석적 절차용."),
+        ("C.외환차손익_상세", "결제 건별 1단계 스크리닝(괴리율) + 기준일 불일치 탐지 + "
+                            "2단계 증빙검증을 거래 하나당 한 줄로 합친 상세 표."),
+        ("D.외화환산손익", "기말 미결제 건에 대한 재평가 전수 검증(정상/환율오류/재평가누락)."),
+        ("E.완전성검증", "계정별원장 대사(분개장 vs 총계정원장) + 거래처별 롤포워드 검증"
+                        "(거래ID 매칭 없이 총액으로 재확인)."),
+    ]
+
+    ws_guide = wb.create_sheet("안내")
+    ws_guide.append(["외환차손익 · 외화환산손익 검증결과 안내"])
+    ws_guide["A1"].font = Font(bold=True, size=14, name="Arial")
+    ws_guide.append([])
+    ws_guide.append(["아래는 각 시트에 대한 설명입니다. 이상치·부적정으로 판정된 행은 빨간색,",])
+    ws_guide.append(["적정으로 판정된 행은 초록색으로 표시되며, 문제 있는 행이 항상 위로 정렬됩니다.",])
+    ws_guide.append([])
+    guide_header_row = ws_guide.max_row + 1
+    ws_guide.cell(row=guide_header_row, column=1, value="시트명").font = HEADER_FONT_XL
+    ws_guide.cell(row=guide_header_row, column=1).fill = HEADER_FILL_XL
+    ws_guide.cell(row=guide_header_row, column=2, value="설명").font = HEADER_FONT_XL
+    ws_guide.cell(row=guide_header_row, column=2).fill = HEADER_FILL_XL
+    for name, desc in SHEET_GUIDE:
+        ws_guide.append([name, desc])
+        r = ws_guide.max_row
+        ws_guide.cell(row=r, column=1).font = BOLD_XL
+        ws_guide.cell(row=r, column=2).font = BODY_FONT_XL
+        ws_guide.cell(row=r, column=1).border = THIN_BORDER
+        ws_guide.cell(row=r, column=2).border = THIN_BORDER
+    ws_guide.append([])
+    r = ws_guide.max_row + 1
+    ws_guide.cell(row=r, column=1, value="색상 범례").font = BOLD_XL
+    r += 1
+    ws_guide.cell(row=r, column=1, value="이상치 / 부적정 (확인 필요)").fill = FLAG_FILL
+    ws_guide.cell(row=r, column=1).font = BODY_FONT_XL
+    r += 1
+    ws_guide.cell(row=r, column=1, value="적정 (통과)").fill = OK_FILL
+    ws_guide.cell(row=r, column=1).font = BODY_FONT_XL
+    ws_guide.column_dimensions["A"].width = 22
+    ws_guide.column_dimensions["B"].width = 70
 
     ws0 = wb.create_sheet("요약")
     ws0.append(["외환차손익·외화환산손익 검증 결과 요약"])
@@ -1055,16 +1142,18 @@ def export_results_to_excel(output_path: str, *, counterparty_summary, rate_tren
     ws0.column_dimensions["A"].width = 22
     ws0.column_dimensions["B"].width = 40
 
-    _write_sheet(wb, "0.표본전체상세", full_detail)
-    _write_sheet(wb, "0.거래처별요약", counterparty_summary)
-    _write_sheet(wb, "0.월별환율추이", rate_trend)
-    _write_sheet(wb, "A.외환차손익_스크리닝", screened)
-    _write_sheet(wb, "A.기준일불일치탐지", ref_check)
-    _write_sheet(wb, "A.증빙검증(2단계)", verified)
-    _write_sheet(wb, "B.외화환산손익", ye_result)
-    _write_sheet(wb, "C.계정별원장대사", ledger_result)
+    _write_sheet(wb, "A.표본전체상세", full_detail)
+    _write_stacked_sheet(wb, "B.분석적검토", [
+        ("거래처별 연간 요약", counterparty_summary),
+        ("월별 환율 추이", rate_trend),
+    ])
+    fx_detail = build_fx_detail_report(screened, ref_check, verified)
+    _write_sheet(wb, "C.외환차손익_상세", fx_detail)
+    _write_sheet(wb, "D.외화환산손익", ye_result)
+    completeness_tables = [("계정별원장 대사", ledger_result)]
     if rollforward_result is not None:
-        _write_sheet(wb, "D.거래처별롤포워드검증", rollforward_result)
+        completeness_tables.append(("거래처별 롤포워드 검증", rollforward_result))
+    _write_stacked_sheet(wb, "E.완전성검증", completeness_tables)
 
     wb.save(output_path)
     print(f"\n결과 엑셀 저장 완료: {output_path}")
