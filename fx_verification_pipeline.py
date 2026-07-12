@@ -35,7 +35,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import requests
 import openpyxl
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ------------------------------------------------------------------
@@ -226,12 +226,20 @@ def extract_settlement_transactions(journal_df: pd.DataFrame) -> pd.DataFrame:
                 f"발생 라인이 {len(occur_rows)}건 섞여 있음. 아래 금액은 신뢰할 수 없으니 원본 확인 필요"
             )
 
-        # 발생원화금액(occur_krw)은 '이 결제 건'에서 실제로 상계된 채권/채무 장부금액을 사용.
-        clear_row = group[group["계정코드"].isin(["108", "251"])]
-        if not clear_row.empty:
-            occur_krw = clear_row.iloc[0][["차변금액", "대변금액"]].fillna(0).abs().max()
+        # 발생원화금액(occur_krw)은 반드시 '원래 발생 전표'에서 가져와야 한다.
+        # 결제 라인의 채권/채무 상계 금액을 그대로 쓰면, 그 상계 자체가 오류인 경우
+        # (예: 외환차익을 인식하지 않고 결제금액으로 그대로 상계한 케이스) 오류가 있는
+        # 금액을 '정상 발생액'으로 오인하게 되어 그 오류 자체를 놓치게 된다.
+        # 분할결제는 원 발생액을 이번 결제 건의 외화금액 비중만큼 비례 안분한다.
+        if not occur_rows.empty:
+            total_occur_fc = occur_rows["외화금액"].sum()
+            total_occur_krw = occur_rows.iloc[0][["차변금액", "대변금액"]].fillna(0).abs().max()
+            if total_occur_fc:
+                occur_krw = total_occur_krw * (fc_amount / total_occur_fc)
+            else:
+                occur_krw = total_occur_krw
         else:
-            occur_krw = occur_rows.iloc[0][["차변금액", "대변금액"]].fillna(0).abs().max() if not occur_rows.empty else None
+            occur_krw = None
 
         records.append({
             "거래ID": txn_id, "결제일": settle_date, "통화": currency, "구분": side, "거래처": partner,
@@ -655,20 +663,259 @@ def verify_ledger_reconciliation(journal_df: pd.DataFrame, ledger_df: pd.DataFra
 
 
 # ------------------------------------------------------------------
+# 5-보조2. 계정매핑 (회사·현장·국가·본지점마다 다른 계정명 대응)
+# ------------------------------------------------------------------
+#
+# 회사(특히 건설업처럼 현장/국가/본지점별로 계정을 쪼개는 업종)마다 실제
+# 계정명이 다 다르다. "외환차익"이라는 표준 문자열이 그대로 안 나오는 경우가
+# 흔하므로, 감사인이 회사의 계정과목 목록(시산표 등)을 한 번 넘겨주면
+# 키워드로 1차 자동분류하고, 애매한 것만 확인받는 방식으로 처리한다.
+# 확인이 끝난 매핑표는 이후 전 회계기간에 재사용 가능하다.
+
+FX_ACCOUNT_KEYWORDS = {
+    "108": (["외상매출금", "매출채권", "수출채권", "AR"], ["외화", "외환", "FX", "USD", "EUR", "JPY"]),
+    "251": (["외상매입금", "매입채무", "수입채무", "AP"], ["외화", "외환", "FX", "USD", "EUR", "JPY"]),
+    "103": (["외화예금", "외환예금"], []),
+    "907": (["외환차익", "환차익", "외화차익", "FX GAIN", "FX 차익"], []),
+    "957": (["외환차손", "환차손", "외화차손", "FX LOSS", "FX 차손"], []),
+    "908": (["외화환산이익", "환산이익", "외화평가이익", "FX TRANSLATION GAIN"], []),
+    "958": (["외화환산손실", "환산손실", "외화평가손실", "FX TRANSLATION LOSS"], []),
+}
+STANDARD_ACCOUNT_NAME = {
+    "108": "외상매출금(외화)", "251": "외상매입금(외화)", "103": "외화예금",
+    "907": "외환차익", "957": "외환차손", "908": "외화환산이익", "958": "외화환산손실",
+}
+
+
+def build_account_mapping(company_accounts: pd.DataFrame) -> pd.DataFrame:
+    """company_accounts: ['회사계정코드', '회사계정명'] 컬럼을 가진 계정과목 목록
+    (시산표, 계정과목 리스트 등)을 받아, 키워드 기준으로 표준분류를 1차 추천한다.
+    하나의 표준분류에만 걸리면 자동 확정, 0개 또는 2개 이상 걸리면 확인 필요로 표시."""
+    rows = []
+    for _, row in company_accounts.iterrows():
+        name_upper = str(row["회사계정명"]).upper()
+        matched = []
+        for std_code, (must_have, nice_to_have) in FX_ACCOUNT_KEYWORDS.items():
+            if any(kw.upper() in name_upper for kw in must_have):
+                matched.append(std_code)
+
+        if len(matched) == 1:
+            status = "자동확정"
+            std_code = matched[0]
+        elif len(matched) == 0:
+            status = "확인필요(매칭 없음)"
+            std_code = None
+        else:
+            status = f"확인필요(중복매칭 {matched})"
+            std_code = None
+
+        rows.append({
+            "회사계정코드": row["회사계정코드"], "회사계정명": row["회사계정명"],
+            "추천표준분류": std_code, "표준분류명": STANDARD_ACCOUNT_NAME.get(std_code),
+            "상태": status,
+        })
+    return pd.DataFrame(rows)
+
+
+def apply_account_mapping(journal_df: pd.DataFrame, confirmed_mapping: dict) -> pd.DataFrame:
+    """감사인이 확인을 마친 매핑({회사계정코드: 표준코드, ...})을 분개장에 적용해
+    계정코드/계정과목을 표준 값(108/251/103/907/957/908/958, 표준 계정명)으로
+    치환한다. 이후 파이프라인 나머지 코드는 전혀 수정 없이 그대로 동작한다."""
+    df = journal_df.copy()
+    df["원본계정코드"] = df["계정코드"]
+    df["원본계정과목"] = df["계정과목"]
+
+    def _map_code(code):
+        return confirmed_mapping.get(str(code).strip(), code)
+
+    df["계정코드"] = df["계정코드"].apply(_map_code)
+    df["계정과목"] = df["계정코드"].map(STANDARD_ACCOUNT_NAME).fillna(df["계정과목"])
+    return df
+
+
+# ------------------------------------------------------------------
+# 5-보조3. 전표번호 자동 부여 (차변=대변이 되는 분개 덩어리 단위)
+# ------------------------------------------------------------------
+#
+# 전표번호가 아예 없는 원본 분개장도 있다. 이 경우 원본 순서대로 훑으면서
+# 누적(차변-대변)이 0으로 돌아오는 지점까지를 전표 1건으로 묶는다.
+# 이건 순수 회계 기계 규칙(차변합계=대변합계)이라 사람 판단이 필요 없다.
+
+def auto_assign_voucher_number(df: pd.DataFrame, tolerance: float = 10) -> pd.DataFrame:
+    """'전표번호(거래ID)' 컬럼이 없는 분개장에 차변=대변=0 단위로 전표번호를
+    자동 부여한다. 원본 파일에 있는 행 순서를 그대로 신뢰한다(전표의 차/대변
+    라인이 서로 떨어져 뒤섞여 있는 경우는 지원하지 않음)."""
+    df = df.reset_index(drop=True).copy()
+    voucher_ids = []
+    voucher_no = 1
+    running_balance = 0.0
+    lines_in_current = 0
+
+    for _, row in df.iterrows():
+        debit = row.get("차변금액")
+        credit = row.get("대변금액")
+        debit = 0 if pd.isna(debit) else debit
+        credit = 0 if pd.isna(credit) else credit
+        running_balance += (debit - credit)
+        lines_in_current += 1
+        voucher_ids.append(f"AUTO{voucher_no:05d}")
+
+        if lines_in_current >= 2 and abs(running_balance) <= tolerance:
+            voucher_no += 1
+            running_balance = 0.0
+            lines_in_current = 0
+
+    if lines_in_current != 0:
+        raise ValueError(
+            f"마지막 전표(AUTO{voucher_no:05d})가 차변=대변으로 안 맞아떨어집니다 "
+            f"(잔액 {running_balance}). 원본 분개장 순서나 누락된 라인을 확인하세요."
+        )
+
+    df["전표번호(거래ID)"] = voucher_ids
+    return df
+
+
+# ------------------------------------------------------------------
+# 5-보조4. 거래처별 롤포워드(잔액 증감) 검증 - 거래ID 매칭 없이도 가능한 총액 검증
+# ------------------------------------------------------------------
+#
+# "100만 달러를 10번에 나눠 갚은" 것처럼 발생-결제를 1:1로 짝짓기 어려운
+# 경우에도, 거래처 단위 잔액 증감(기초+발생-기말=소멸장부가)만으로 실현
+# 외환차손익 총액을 구할 수 있다 (재고자산 롤포워드와 같은 원리).
+# 이 총액을 거래ID 매칭 기반 합계(bottom-up)와 비교하면, 매칭 자체가 안 맞는
+# 경우(거래 누락/중복)를 거래ID 매칭 없이도 발견할 수 있다.
+
+def build_rollforward_verification(journal_df: pd.DataFrame, schedule_df: pd.DataFrame,
+                                    screened: pd.DataFrame,
+                                    opening_balances: dict | None = None) -> pd.DataFrame:
+    """거래처(+통화) 단위로 기초+당기발생-기말미결제=소멸장부가를 구하고,
+    실제결제현금총액과 비교해 실현외환차손익 총액을 역산한다.
+    채권(108, 자산성)은 +, 채무(251, 부채성)는 -로 부호를 통일해서 더해야
+    양쪽이 섞여도 방향이 맞는다 (채무는 '적게 갚을수록' 이익이라 채권과 반대).
+    opening_balances: {(거래처, 통화): 기초장부가(KRW, 부호 통일)} - 없으면 0으로 가정
+    (전기 이월 명세서가 없다는 뜻이므로, 결과에 그 가정을 명시한다)."""
+    opening_balances = opening_balances or {}
+
+    def _signed_amount(row) -> float:
+        amt = row[["차변금액", "대변금액"]].fillna(0).abs().max()
+        return amt if row["계정코드"] == "108" else -amt
+
+    occur_rows = journal_df[(journal_df["구분"] == "발생") &
+                             (journal_df["계정코드"].isin(["108", "251"]))].copy()
+    occur_rows["_signed"] = occur_rows.apply(_signed_amount, axis=1)
+    occur_by_partner = occur_rows.groupby(["거래처", "통화"])["_signed"].sum()
+
+    # 외화예금 라인이 차변(입금=채권 결제)인지 대변(출금=채무 결제)인지로 부호 결정
+    cash_rows = journal_df[(journal_df["구분"] == "결제") & (journal_df["계정과목"] == "외화예금")].copy()
+    cash_rows["_signed"] = cash_rows.apply(
+        lambda r: (r["차변금액"] if pd.notna(r["차변금액"]) else -r["대변금액"]), axis=1
+    )
+    cash_by_partner = cash_rows.groupby(["거래처", "통화"])["_signed"].sum()
+
+    # 기말 미결제 장부가: 명세서상 기말미결제외화잔액>0인 거래ID의 발생 장부가(부호 포함)를 거래처별로 합산
+    outstanding_ids = set(schedule_df.loc[schedule_df["기말미결제외화잔액"] > 0, "전표번호(거래ID)"])
+    outstanding_rows = occur_rows[occur_rows["전표번호(거래ID)"].isin(outstanding_ids)]
+    outstanding_by_partner = outstanding_rows.groupby(["거래처", "통화"])["_signed"].sum()
+
+    bottom_up_by_partner = screened.groupby(["거래처", "통화"])["회사계상_외환차익차손"].sum()
+
+    all_keys = set(occur_by_partner.index) | set(cash_by_partner.index)
+    rows = []
+    for key in sorted(all_keys):
+        partner, currency = key
+        opening = opening_balances.get(key, 0)
+        occur_total = occur_by_partner.get(key, 0)
+        ending_outstanding = outstanding_by_partner.get(key, 0)
+        cash_total = cash_by_partner.get(key, 0)
+
+        consumed_book_value = opening + occur_total - ending_outstanding
+        rollforward_gain_loss = cash_total - consumed_book_value
+        bottom_up_total = bottom_up_by_partner.get(key, 0)
+        diff = round(bottom_up_total - rollforward_gain_loss)
+
+        rows.append({
+            "거래처": partner, "통화": currency,
+            "기초장부가(가정)": opening, "당기발생장부가(부호포함)": round(occur_total),
+            "기말미결제장부가(부호포함)": round(ending_outstanding), "실제결제현금총액(부호포함)": round(cash_total),
+            "롤포워드_실현손익": round(rollforward_gain_loss),
+            "거래ID매칭_실현손익합계": round(bottom_up_total),
+            "차이": diff,
+            "판정": "적정(매칭 정합성 확인)" if abs(diff) <= 1000 else "불일치(거래 누락/중복 의심 - 매칭 재확인 필요)",
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------------
 # 6. 결과 엑셀 저장
 # ------------------------------------------------------------------
 
 FLAG_FILL = PatternFill(start_color="F8CBAD", end_color="F8CBAD", fill_type="solid")
-OK_FILL = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")
-HEADER_FILL_XL = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-BOLD_XL = Font(bold=True)
+OK_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+HEADER_FILL_XL = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
+HEADER_FONT_XL = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+BODY_FONT_XL = Font(name="Arial", size=10)
+BOLD_XL = Font(bold=True, name="Arial", size=10)
+THIN_BORDER = Border(bottom=Side(style="thin", color="D9D9D9"))
 
-FLAG_VALUES = {"이상치(정밀검증필요)", "부적정(분개장-원장 불일치)", "부적정(환율 오류)",
-               "부적정(기말평가 누락)", "부적정(계정별원장에 해당 계정 없음)",
-               "전체 재검토 필요(합계 중요성 초과)", "미확인(증빙 미확보)",
-               "미확인(OCR 실패)", "부적정(증빙과 불일치 - 재계산 필요)"}
-OK_VALUES = {"적정(스크리닝통과)", "적정", "전체 적정(합계 중요성 이내)",
-             "정상(결제일 환율 사용 확인)", "증빙 확인 완료", "적정(증빙과 일치)"}
+# 어떤 열이든, 셀 값에 이 키워드가 들어있으면 '문제 있음' / '문제 없음'으로 판단.
+# (동적으로 날짜 등이 붙는 문구, 예: "기준일 오류 의심 - 2025-04-30..."도 substring으로 잡기 위해
+#  정확히 일치하는 값 목록이 아니라 키워드 포함 여부로 판단)
+FLAG_KEYWORDS = ["이상치", "부적정", "오류", "불일치", "누락", "미확인", "재검토 필요", "확인 필요"]
+OK_KEYWORDS = ["적정", "정상", "통과", "완료"]
+
+# 컬럼명을 사람이 읽기 좋은 표현으로 변경 (내부 로직 컬럼명은 그대로 유지, 엑셀 출력시에만 적용)
+COLUMN_LABELS = {
+    "회사적용환율(내재)": "회사 적용환율", "회사계상_외환차익차손": "회사 계상액",
+    "공식매매기준율": "공식 매매기준율", "공식환율기준일": "환율 기준일",
+    "1차플래그": "판정", "재계산_외환차손익(공식환율기준)": "재계산액",
+    "회사계상액과의차이(KRW)": "차이(KRW)", "기준일판정": "기준일 판정",
+    "추정사용일자": "추정 사용일자", "회사적용환율(기말)": "회사 적용환율(기말)",
+    "공식결산환율": "공식 결산환율", "분개장_차변합계": "분개장 차변합계",
+    "분개장_대변합계": "분개장 대변합계", "원장_차변합계": "원장 차변합계",
+    "원장_대변합계": "원장 대변합계", "회사계상_외환차손익_합계": "회사계상 합계",
+    "재계산_외환차손익_합계": "재계산 합계", "차이_합계(KRW)": "차이합계(KRW)",
+    "회사평균적용환율": "회사평균환율", "데이터무결성경고": "데이터 무결성 경고",
+}
+
+# 열 이름 패턴에 따른 표시 서식
+AMOUNT_FORMAT = "#,##0;[RED]-#,##0"
+RATE_FORMAT = "#,##0.0000"
+PCT_FORMAT = '0.0"%"'
+INT_FORMAT = "#,##0"
+
+
+DATE_FORMAT = "yyyy-mm-dd"
+
+
+def _column_number_format(col_name: str) -> str | None:
+    if "%" in col_name:
+        return PCT_FORMAT
+    if "환율" in col_name:
+        return RATE_FORMAT
+    if any(k in col_name for k in ["금액", "차이", "합계"]):
+        return AMOUNT_FORMAT
+    if "건수" in col_name:
+        return INT_FORMAT
+    if col_name.endswith("일") or col_name.endswith("일자"):
+        return DATE_FORMAT
+    return None
+
+
+def _row_status(values: list, headers: list = None) -> str:
+    """행에 있는 값들을 훑어서 '문제 있음'/'문제 없음'/'중립'을 판단.
+    텍스트 판정 컬럼(예: '1차플래그')뿐 아니라, '이상치건수'처럼 숫자로만
+    표시되는 컬럼이 0보다 크면 그것도 '문제 있음'으로 인식한다."""
+    if headers:
+        for h, v in zip(headers, values):
+            if "이상치건수" in str(h) and isinstance(v, (int, float)) and v > 0:
+                return "flag"
+    text = " ".join(str(v) for v in values if v is not None)
+    if any(k in text for k in FLAG_KEYWORDS):
+        return "flag"
+    if any(k in text for k in OK_KEYWORDS):
+        return "ok"
+    return "neutral"
 
 
 def _write_sheet(wb, sheet_name: str, df: pd.DataFrame):
@@ -676,44 +923,84 @@ def _write_sheet(wb, sheet_name: str, df: pd.DataFrame):
     if df is None or df.empty:
         ws.append(["(해당 없음)"])
         return
-    ws.append(list(df.columns))
-    for c in range(1, len(df.columns) + 1):
+
+    df = df.rename(columns=COLUMN_LABELS)
+
+    # 이상치/부적정 행이 위로 오도록 정렬 (같은 상태 안에서는 원래 순서 유지)
+    status_list = [_row_status(row.tolist(), df.columns.tolist()) for _, row in df.iterrows()]
+    order = {"flag": 0, "neutral": 1, "ok": 2}
+    df = df.assign(_status=status_list).sort_values(
+        "_status", key=lambda s: s.map(order), kind="stable"
+    )
+    statuses = df["_status"].tolist()
+    df = df.drop(columns="_status")
+
+    headers = list(df.columns)
+    ws.append(headers)
+    for c in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=c)
-        cell.font = BOLD_XL
+        cell.font = HEADER_FONT_XL
         cell.fill = HEADER_FILL_XL
-    for _, row in df.iterrows():
+
+    number_formats = [_column_number_format(h) for h in headers]
+
+    for row_idx, ((_, row), status) in enumerate(zip(df.iterrows(), statuses), start=2):
         ws.append([None if pd.isna(v) else v for v in row.tolist()])
-    for r in range(2, ws.max_row + 1):
-        for c in range(1, len(df.columns) + 1):
+        row_fill = FLAG_FILL if status == "flag" else (OK_FILL if status == "ok" else None)
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=row_idx, column=c)
+            cell.font = BODY_FONT_XL
+            cell.border = THIN_BORDER
+            if row_fill:
+                cell.fill = row_fill
+            if number_formats[c - 1] and isinstance(cell.value, (int, float, datetime, pd.Timestamp)):
+                cell.number_format = number_formats[c - 1]
+
+    # 열 너비: 헤더/내용 길이 중 더 긴 쪽 기준으로 자동 설정 (최소 10, 최대 32)
+    # 한글 등 CJK 문자는 폭이 영문의 약 1.8배이므로 가중치를 둬서 계산한다.
+    def _display_width(s: str) -> float:
+        return sum(1.8 if ord(ch) > 0x2E80 else 1.0 for ch in s)
+
+    for c, header in enumerate(headers, start=1):
+        max_len = _display_width(str(header))
+        for r in range(2, ws.max_row + 1):
             val = ws.cell(row=r, column=c).value
-            if val in FLAG_VALUES:
-                ws.cell(row=r, column=c).fill = FLAG_FILL
-            elif val in OK_VALUES:
-                ws.cell(row=r, column=c).fill = OK_FILL
-    for c in range(1, len(df.columns) + 1):
-        ws.column_dimensions[get_column_letter(c)].width = 18
+            if val is not None:
+                max_len = max(max_len, _display_width(str(val)))
+        ws.column_dimensions[get_column_letter(c)].width = min(max(max_len + 2, 10), 34)
+
     ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
 
 
 def export_results_to_excel(output_path: str, *, counterparty_summary, rate_trend,
-                             screened, agg, ref_check, verified, ye_result, ledger_result):
+                             screened, agg, ref_check, verified, ye_result, ledger_result,
+                             rollforward_result=None):
     """전체 검증 결과를 시트별로 나눠 하나의 엑셀 워크북으로 저장.
-    이상치/부적정 셀은 빨간색, 적정 셀은 초록색으로 하이라이트."""
+    이상치/부적정 행은 빨간색, 적정 행은 초록색으로 통째로 하이라이트하고 맨 위로 정렬,
+    금액/환율/퍼센트 열은 각각 알맞은 서식을 자동 적용한다."""
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
     ws0 = wb.create_sheet("요약")
     ws0.append(["외환차손익·외화환산손익 검증 결과 요약"])
-    ws0["A1"].font = Font(bold=True, size=14)
+    ws0["A1"].font = Font(bold=True, size=14, name="Arial")
     ws0.append([])
-    ws0.append(["합계 중요성(AMPT)", agg["AMPT"]])
-    ws0.append(["순차이합계(KRW)", agg["순차이합계(KRW)"]])
-    ws0.append(["절대값차이합계(KRW)", agg["절대값차이합계(KRW)"]])
-    ws0.append(["판정", agg["판정"]])
-    if agg["판정"] in FLAG_VALUES:
-        ws0.cell(row=ws0.max_row, column=2).fill = FLAG_FILL
-    for r in range(3, 7):
+    summary_rows = [
+        ("합계 중요성(AMPT)", agg["AMPT"], AMOUNT_FORMAT),
+        ("순차이합계(KRW)", agg["순차이합계(KRW)"], AMOUNT_FORMAT),
+        ("절대값차이합계(KRW)", agg["절대값차이합계(KRW)"], AMOUNT_FORMAT),
+        ("판정", agg["판정"], None),
+    ]
+    for label, value, fmt in summary_rows:
+        ws0.append([label, value])
+        r = ws0.max_row
         ws0.cell(row=r, column=1).font = BOLD_XL
+        ws0.cell(row=r, column=2).font = BODY_FONT_XL
+        if fmt:
+            ws0.cell(row=r, column=2).number_format = fmt
+        if _row_status([label, value]) == "flag":
+            ws0.cell(row=r, column=2).fill = FLAG_FILL
     ws0.column_dimensions["A"].width = 22
     ws0.column_dimensions["B"].width = 40
 
@@ -724,6 +1011,8 @@ def export_results_to_excel(output_path: str, *, counterparty_summary, rate_tren
     _write_sheet(wb, "A.증빙검증(2단계)", verified)
     _write_sheet(wb, "B.외화환산손익", ye_result)
     _write_sheet(wb, "C.계정별원장대사", ledger_result)
+    if rollforward_result is not None:
+        _write_sheet(wb, "D.거래처별롤포워드검증", rollforward_result)
 
     wb.save(output_path)
     print(f"\n결과 엑셀 저장 완료: {output_path}")
@@ -786,9 +1075,13 @@ if __name__ == "__main__":
     ledger_result = verify_ledger_reconciliation(journal, ledger)
     print(ledger_result)
 
+    print("\n=== D. 거래처별 롤포워드 검증 (거래ID 매칭 없이 총액 정합성 확인) ===")
+    rollforward_result = build_rollforward_verification(journal, schedule, screened)
+    print(rollforward_result)
+
     export_results_to_excel(
         "검증결과.xlsx",
         counterparty_summary=counterparty_summary, rate_trend=rate_trend,
         screened=screened, agg=agg, ref_check=ref_check, verified=verified,
-        ye_result=ye_result, ledger_result=ledger_result,
+        ye_result=ye_result, ledger_result=ledger_result, rollforward_result=rollforward_result,
     )
