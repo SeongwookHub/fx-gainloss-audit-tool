@@ -847,6 +847,49 @@ def build_rollforward_verification(journal_df: pd.DataFrame, schedule_df: pd.Dat
 
 
 # ------------------------------------------------------------------
+# 5-보조5. 전체 표본 분개 상세 (샘플링된 모든 분개 원본 + 거래별 판정)
+# ------------------------------------------------------------------
+#
+# 지금까지의 시트들은 전부 "거래 단위로 요약된" 뷰라, 실제 분개장 원본 라인이
+# 통째로 보이는 시트가 없었다. 검증 대상이 된 분개 전체(=이번에 표본으로
+# 들어간 모든 전표)를 원본 라인 그대로 보여주되, 각 거래ID에 대해 이번
+# 검증에서 어떤 판정이 나왔는지를 같이 붙여서, "표본 전체 중 어떤 분개가
+# 문제였는지"를 한 시트에서 볼 수 있게 한다.
+
+def build_full_journal_detail(journal_df: pd.DataFrame, screened: pd.DataFrame,
+                               ye_result: pd.DataFrame) -> pd.DataFrame:
+    """검증 대상이 된 분개장 원본 라인 전체에, 거래ID별 최종 판정(결제 스크리닝,
+    기말평가, 데이터무결성경고 등)을 합쳐서 보여준다. 문제 있는 거래의 라인이
+    맨 위로 오도록 정렬한다."""
+    status_map: dict = {}
+
+    for _, r in screened.iterrows():
+        txn_id = r["거래ID"]
+        settle_date = r["결제일"]
+        date_str = settle_date.strftime("%Y-%m-%d") if hasattr(settle_date, "strftime") else str(settle_date)
+        status_map.setdefault(txn_id, []).append(f"결제({date_str}): {r['1차플래그']}")
+        if pd.notna(r.get("데이터무결성경고")):
+            status_map.setdefault(txn_id, []).append(f"⚠ {r['데이터무결성경고']}")
+
+    for _, r in ye_result.iterrows():
+        txn_id = r["거래ID"]
+        status_map.setdefault(txn_id, []).append(f"기말평가: {r['일치여부']}")
+
+    def _status_for(txn_id):
+        return " / ".join(status_map.get(txn_id, ["결제·기말평가 대상 아님(발생만 있거나 검증 범위 밖)"]))
+
+    df = journal_df.copy()
+    df["거래_최종판정"] = df["전표번호(거래ID)"].map(_status_for)
+
+    order_key = df["거래_최종판정"].apply(lambda s: {"flag": 0, "neutral": 1, "ok": 2}[_row_status([s])])
+    sort_cols = ["전표번호(거래ID)"] + (["라인번호"] if "라인번호" in df.columns else [])
+    df = (df.assign(_order=order_key)
+            .sort_values(["_order"] + sort_cols, kind="stable")
+            .drop(columns="_order"))
+    return df
+
+
+# ------------------------------------------------------------------
 # 6. 결과 엑셀 저장
 # ------------------------------------------------------------------
 
@@ -893,7 +936,7 @@ def _column_number_format(col_name: str) -> str | None:
         return PCT_FORMAT
     if "환율" in col_name:
         return RATE_FORMAT
-    if any(k in col_name for k in ["금액", "차이", "합계"]):
+    if any(k in col_name for k in ["금액", "차이", "합계", "순액"]):
         return AMOUNT_FORMAT
     if "건수" in col_name:
         return INT_FORMAT
@@ -925,6 +968,14 @@ def _write_sheet(wb, sheet_name: str, df: pd.DataFrame):
         return
 
     df = df.rename(columns=COLUMN_LABELS)
+
+    # 차변금액/대변금액이 있으면 그 바로 오른쪽에 순액(차변-대변)을 자동으로 추가
+    if "차변금액" in df.columns and "대변금액" in df.columns:
+        debit = pd.to_numeric(df["차변금액"], errors="coerce").fillna(0)
+        credit = pd.to_numeric(df["대변금액"], errors="coerce").fillna(0)
+        insert_at = df.columns.get_loc("대변금액") + 1
+        df = df.copy()
+        df.insert(insert_at, "순액", debit - credit)
 
     # 이상치/부적정 행이 위로 오도록 정렬 (같은 상태 안에서는 원래 순서 유지)
     status_list = [_row_status(row.tolist(), df.columns.tolist()) for _, row in df.iterrows()]
@@ -975,7 +1026,7 @@ def _write_sheet(wb, sheet_name: str, df: pd.DataFrame):
 
 def export_results_to_excel(output_path: str, *, counterparty_summary, rate_trend,
                              screened, agg, ref_check, verified, ye_result, ledger_result,
-                             rollforward_result=None):
+                             rollforward_result=None, full_detail=None):
     """전체 검증 결과를 시트별로 나눠 하나의 엑셀 워크북으로 저장.
     이상치/부적정 행은 빨간색, 적정 행은 초록색으로 통째로 하이라이트하고 맨 위로 정렬,
     금액/환율/퍼센트 열은 각각 알맞은 서식을 자동 적용한다."""
@@ -1004,6 +1055,7 @@ def export_results_to_excel(output_path: str, *, counterparty_summary, rate_tren
     ws0.column_dimensions["A"].width = 22
     ws0.column_dimensions["B"].width = 40
 
+    _write_sheet(wb, "0.표본전체상세", full_detail)
     _write_sheet(wb, "0.거래처별요약", counterparty_summary)
     _write_sheet(wb, "0.월별환율추이", rate_trend)
     _write_sheet(wb, "A.외환차손익_스크리닝", screened)
@@ -1079,9 +1131,12 @@ if __name__ == "__main__":
     rollforward_result = build_rollforward_verification(journal, schedule, screened)
     print(rollforward_result)
 
+    full_detail = build_full_journal_detail(journal, screened, ye_result)
+
     export_results_to_excel(
         "검증결과.xlsx",
         counterparty_summary=counterparty_summary, rate_trend=rate_trend,
         screened=screened, agg=agg, ref_check=ref_check, verified=verified,
         ye_result=ye_result, ledger_result=ledger_result, rollforward_result=rollforward_result,
+        full_detail=full_detail,
     )
