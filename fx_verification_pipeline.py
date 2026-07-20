@@ -1273,6 +1273,193 @@ def export_results_to_excel(output_path: str, *, counterparty_summary, rate_tren
 
 
 # ------------------------------------------------------------------
+# 6-보조. 감사조서(Word) 저장
+# ------------------------------------------------------------------
+
+def _first_non_null(row, cols: list):
+    """row(Series)에서 cols 순서대로 값이 있는(NaN/None이 아닌) 첫 값을 반환.
+    여러 판정 컬럼(1차플래그/기준일판정/최종판정 등) 중 있는 것만 이어붙이는 데 사용."""
+    for c in cols:
+        v = row.get(c) if hasattr(row, "get") else None
+        if v is not None and not pd.isna(v):
+            return v
+    return None
+
+
+def _collect_exception_rows(구분: str, df: pd.DataFrame, id_col: str, judge_cols: list,
+                             diff_col: str = None) -> list:
+    """df를 훑어 _row_status()가 'flag'로 판정한 행만 감사조서 Exception 표 형식으로 뽑아낸다.
+    새 판정을 만들지 않고, Excel 하이라이트에 쓰는 것과 동일한 _row_status()/FLAG_KEYWORDS를
+    그대로 재사용해 Excel과 Word 산출물의 Exception 목록이 항상 일치하도록 한다."""
+    if df is None or df.empty:
+        return []
+    rows = []
+    headers = df.columns.tolist()
+    for _, row in df.iterrows():
+        if _row_status(row.tolist(), headers) != "flag":
+            continue
+        judge_parts = []
+        for c in judge_cols:
+            v = row.get(c)
+            if v is not None and not pd.isna(v) and "정상" not in str(v) and "대상 아님" not in str(v):
+                judge_parts.append(str(v))
+        diff = row.get(diff_col) if diff_col else None
+        rows.append({
+            "구분": 구분,
+            "식별자": row.get(id_col),
+            "통화": row.get("통화", "-"),
+            "판정": " / ".join(judge_parts) if judge_parts else "부적정",
+            "차이금액(KRW)": diff if diff is not None and not pd.isna(diff) else None,
+        })
+    return rows
+
+
+def generate_audit_workpaper(output_path: str, *, screened: pd.DataFrame, agg: dict,
+                              ref_check: pd.DataFrame, verified: pd.DataFrame,
+                              ye_result: pd.DataFrame, ledger_result: pd.DataFrame,
+                              rollforward_result: pd.DataFrame, year_end_date: str) -> None:
+    """검증결과.xlsx와 별도로, 이미 계산된 결과(screened/agg/ye_result/ledger_result/
+    rollforward_result 등)를 감사조서 표준 형식(검증 목적 - 검증 대상 - 수행 절차 -
+    검증 결과 - 결론)의 Word 문서로 옮겨 적는다. 여기서 새로운 판단(중요성 판단, 개별 건의
+    적정/부적정 판정)을 내리지 않고, 파이프라인이 이미 만든 판정 문자열과 플래그
+    (_row_status/FLAG_KEYWORDS - Excel 하이라이트와 동일 기준)를 그대로 인용만 한다."""
+    from docx import Document
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
+
+    doc = Document()
+    normal = doc.styles["Normal"]
+    normal.font.name = "맑은 고딕"
+    normal.font.size = Pt(10)
+    normal.element.rPr.rFonts.set(qn("w:eastAsia"), "맑은 고딕")
+
+    doc.add_heading("감사조서 - 외환차손익 및 외화환산손익 검증", level=0)
+    doc.add_paragraph(f"결산일: {year_end_date}    작성일시(자동생성): "
+                       f"{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    doc.add_paragraph().add_run(
+        "본 조서는 검증 파이프라인의 산출물을 자동으로 정리한 것으로, "
+        "최종 감사의견 및 중요성 판단은 감사인이 수행한다."
+    ).italic = True
+
+    # 1. 검증 목적
+    doc.add_heading("1. 검증 목적", level=1)
+    doc.add_paragraph(
+        f"결산일({year_end_date}) 현재 외화화폐성 항목에 대해 계상된 외환차손익(실현손익) "
+        "및 외화환산손익(미실현손익)이 적용환율 및 관련 회계처리 기준에 따라 적정하게 "
+        "계상되었는지 확인한다."
+    )
+
+    # 2. 검증 대상
+    doc.add_heading("2. 검증 대상", level=1)
+    counterparty_cnt = screened["거래처"].nunique() if "거래처" in screened.columns else 0
+    doc.add_paragraph(f"대상 거래처 수(결제 건 기준): {counterparty_cnt}개")
+    settle_by_cur = (screened.groupby("통화").agg(결제건수=("거래ID", "count"),
+                                                  결제외화금액합계=("외화금액", "sum"))
+                      if not screened.empty else pd.DataFrame(columns=["결제건수", "결제외화금액합계"]))
+    ye_by_cur = (ye_result.groupby("통화").agg(기말미결제건수=("거래ID", "count"),
+                                               기말외화금액합계=("외화금액", "sum"))
+                 if not ye_result.empty else pd.DataFrame(columns=["기말미결제건수", "기말외화금액합계"]))
+    currency_summary = settle_by_cur.join(ye_by_cur, how="outer").fillna(0).reset_index()
+    currency_summary = currency_summary.rename(columns={"index": "통화"})
+    if currency_summary.empty:
+        doc.add_paragraph("(해당 없음)")
+    else:
+        table = doc.add_table(rows=1, cols=len(currency_summary.columns))
+        table.style = "Table Grid"
+        for c, h in enumerate(currency_summary.columns):
+            table.rows[0].cells[c].text = str(h)
+        for _, row in currency_summary.iterrows():
+            cells = table.add_row().cells
+            for c, val in enumerate(row):
+                cells[c].text = f"{val:,.0f}" if isinstance(val, (int, float)) else str(val)
+
+    # 3. 수행 절차
+    doc.add_heading("3. 수행 절차", level=1)
+    procedures = [
+        "1단계 스크리닝: 결제 건별로 분개상 원화금액·외화금액에서 내재환율을 역산해, "
+        "결제일의 한국수출입은행 공식 매매기준율과 비교한다. 괴리율이 5%를 초과하는 "
+        "거래를 이상치로 플래그한다.",
+        "합계 중요성(AMPT) 검증: 개별 건이 괴리율 기준을 통과하더라도, 재계산액과 "
+        "회사계상액의 차이를 전체 합산해 허용가능 오류금액(AMPT) 초과 여부를 확인한다.",
+        "결제일-환율기준일 불일치 탐지: 회사 적용환율이 결제일이 아닌 다른 날짜(전월말, "
+        "전영업일 등)의 공식 환율과 정확히 일치하는지 확인해 기준일 오적용을 탐지한다.",
+        "2단계 증빙 대조(Vision OCR): 1단계 이상치로 플래그된 거래에 대해 은행 "
+        "외환거래확인서 등 증빙을 Claude Vision으로 읽어 실제 적용환율을 추출하고 "
+        "회사 계상액과 최종 대사한다.",
+        "기말환산 검증: 결산일 현재 미결제 외화자산·부채를 결산일 공식 환율로 전수 "
+        "재평가해 기말 환산 처리의 적정성을 확인한다(재평가 누락 건 포함).",
+        "계정별원장 대사: 분개장에서 집계한 외환차익·차손·외화환산이익·손실 계정 합계가 "
+        "총계정원장 잔액과 일치하는지 확인해 수기 조정 등으로 인한 완전성 이슈를 탐지한다.",
+        "롤포워드 검증: 발생-결제 거래를 1:1 매칭하기 어려운 경우에도, 거래처·통화 "
+        "단위로 기초+당기발생-기말잔액=결제액의 원리로 총액 정합성을 재확인한다.",
+    ]
+    for i, text in enumerate(procedures, start=1):
+        doc.add_paragraph(f"{i}) {text}", style="List Number")
+
+    # 4. 검증 결과
+    doc.add_heading("4. 검증 결과", level=1)
+    total_population = len(screened) + len(ye_result)
+    doc.add_paragraph(f"전체 검증 대상: {total_population:,}건 "
+                       f"(외환차손익 결제 건 {len(screened):,}건 + 외화환산손익 기말 미결제 건 "
+                       f"{len(ye_result):,}건)")
+    doc.add_paragraph(f"합계 중요성(AMPT): {agg['AMPT']:,.0f}원 / "
+                       f"절대값차이합계(KRW): {agg['절대값차이합계(KRW)']:,.0f}원 / "
+                       f"판정: {agg['판정']}")
+    if agg.get("확인불가건수", 0):
+        doc.add_paragraph(f"환율조회 실패 등으로 확인 불가능한 건: {agg['확인불가건수']:,}건")
+
+    fx_detail = build_fx_detail_report(screened, ref_check, verified)
+    exception_rows = []
+    exception_rows += _collect_exception_rows(
+        "외환차손익(결제)", fx_detail, "거래ID",
+        ["1차플래그", "기준일판정", "최종판정"], "회사계상액과의차이(KRW)")
+    exception_rows += _collect_exception_rows(
+        "외화환산손익(기말)", ye_result, "거래ID", ["일치여부"])
+    exception_rows += _collect_exception_rows(
+        "완전성검증(원장대사)", ledger_result, "계정과목", ["일치여부"])
+    exception_rows += _collect_exception_rows(
+        "완전성검증(롤포워드)", rollforward_result, "거래처", ["판정"], "차이")
+
+    doc.add_paragraph(f"Exception(이상치/부적정) 건수: {len(exception_rows):,}건")
+    if exception_rows:
+        cols = ["구분", "식별자", "통화", "판정", "차이금액(KRW)"]
+        table = doc.add_table(rows=1, cols=len(cols))
+        table.style = "Table Grid"
+        for c, h in enumerate(cols):
+            table.rows[0].cells[c].text = h
+        for exc in exception_rows:
+            cells = table.add_row().cells
+            for c, key in enumerate(cols):
+                val = exc[key]
+                if key == "차이금액(KRW)" and isinstance(val, (int, float)):
+                    cells[c].text = f"{val:,.0f}"
+                else:
+                    cells[c].text = str(val) if val is not None else "-"
+    else:
+        doc.add_paragraph("(해당 없음)")
+
+    # 5. 결론
+    doc.add_heading("5. 결론", level=1)
+    breach = agg["중요성초과여부"]
+    if breach:
+        conclusion = (f"합계 중요성 검증 결과, 절대값차이합계 {agg['절대값차이합계(KRW)']:,.0f}원이 "
+                      f"허용가능 오류금액(AMPT) {agg['AMPT']:,.0f}원을 초과하여 중요한 차이가 "
+                      "발견되었다.")
+    else:
+        conclusion = (f"합계 중요성 검증 결과, 절대값차이합계 {agg['절대값차이합계(KRW)']:,.0f}원이 "
+                      f"허용가능 오류금액(AMPT) {agg['AMPT']:,.0f}원 이내로, 중요한 차이는 발견되지 "
+                      "않았다.")
+    if exception_rows:
+        conclusion += f" 상기 Exception {len(exception_rows):,}건에 대해서는 추가 검토가 필요하다."
+    else:
+        conclusion += " Exception으로 식별된 건은 없다."
+    doc.add_paragraph(conclusion)
+
+    doc.save(output_path)
+    print(f"감사조서 저장 완료: {output_path}")
+
+
+# ------------------------------------------------------------------
 # 7. 실행
 # ------------------------------------------------------------------
 
@@ -1289,6 +1476,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="검증결과.xlsx", help="결과 엑셀 저장 경로")
     parser.add_argument("--ampt", type=float, default=AMPT,
                          help="허용가능 오류금액(Tolerable Misstatement). 기본값은 FX_AMPT 환경변수")
+    parser.add_argument("--workpaper", action="store_true",
+                         help="검증결과.xlsx와 함께 감사조서(.docx)도 생성")
+    parser.add_argument("--workpaper-output", default="감사조서_외환차손익.docx",
+                         help="감사조서 Word 파일 저장 경로 (--workpaper와 함께 사용)")
     return parser
 
 
@@ -1360,6 +1551,14 @@ def main(argv=None):
         ye_result=ye_result, ledger_result=ledger_result, rollforward_result=rollforward_result,
         full_detail=full_detail,
     )
+
+    if args.workpaper:
+        generate_audit_workpaper(
+            args.workpaper_output,
+            screened=screened, agg=agg, ref_check=ref_check, verified=verified,
+            ye_result=ye_result, ledger_result=ledger_result,
+            rollforward_result=rollforward_result, year_end_date=args.year_end_date,
+        )
 
 
 if __name__ == "__main__":

@@ -432,3 +432,96 @@ class TestExportResultsToExcel:
             "안내", "요약", "A.표본전체상세", "B.분석적검토",
             "C.외환차손익_상세", "D.외화환산손익", "E.완전성검증",
         }
+
+
+# ------------------------------------------------------------------
+# 감사조서(Word) 자동생성 - 문서가 열리는지, 필수 섹션/Exception이 반영됐는지만 확인
+# (셀 서식 등은 검증하지 않음, Excel과 마찬가지로 텍스트 존재 여부만 확인)
+# ------------------------------------------------------------------
+
+class TestGenerateAuditWorkpaper:
+    def test_workpaper_reflects_sample_data_exceptions(self, tmp_path, sample_pipeline_inputs, monkeypatch):
+        journal, schedule = sample_pipeline_inputs
+        monkeypatch.setattr(fxp, "fetch_rates_for_date", _make_fake_fetch(SAMPLE_FAKE_RATES))
+        # 증빙 폴더를 빈 임시경로로 돌려서, 2단계 OCR(실제 API 호출)이 아예 시도되지
+        # 않도록 한다 - _find_evidence_file이 항상 None을 반환하므로 네트워크 호출 없음.
+        monkeypatch.setattr(fxp, "EVIDENCE_DIR", str(tmp_path / "no_evidence"))
+        ledger = pd.read_excel(SAMPLE_DIR / "계정별원장.xlsx")
+
+        settlements = fxp.extract_settlement_transactions(journal)
+        screened = fxp.screen_fx_settlements(settlements)
+        ref_check = fxp.detect_reference_date_mismatch(settlements)
+        agg = fxp.check_aggregate_materiality(screened, ampt=3000000)
+        to_verify = (screened if agg["중요성초과여부"]
+                     else screened[screened["1차플래그"] == "이상치(정밀검증필요)"])
+        verified = fxp.verify_with_evidence(to_verify)
+
+        ye_txns = fxp.extract_yearend_transactions(journal)
+        missing_ye = fxp.get_unsettled_yearend_candidates(journal, schedule)
+        ye_result = fxp.verify_yearend_translation(ye_txns, missing_ye, "2025-12-31")
+
+        ledger_result = fxp.verify_ledger_reconciliation(journal, ledger)
+        rollforward_result = fxp.build_rollforward_verification(journal, schedule, screened)
+
+        output_path = tmp_path / "감사조서_테스트.docx"
+        fxp.generate_audit_workpaper(
+            str(output_path),
+            screened=screened, agg=agg, ref_check=ref_check, verified=verified,
+            ye_result=ye_result, ledger_result=ledger_result,
+            rollforward_result=rollforward_result, year_end_date="2025-12-31",
+        )
+
+        assert output_path.exists()
+        import docx
+        doc = docx.Document(str(output_path))
+
+        headings = [p.text for p in doc.paragraphs if p.style.name.startswith("Heading")]
+        for expected in ["1. 검증 목적", "2. 검증 대상", "3. 수행 절차",
+                          "4. 검증 결과", "5. 결론"]:
+            assert expected in headings
+
+        all_text = "\n".join(p.text for p in doc.paragraphs)
+        for table in doc.tables:
+            for row in table.rows:
+                all_text += "\n" + " ".join(cell.text for cell in row.cells)
+
+        # sample_data는 합계 중요성을 초과하도록 설계돼 있음(TestSampleDataOracle과 동일 전제)
+        assert agg["중요성초과여부"]
+        assert "중요한 차이가 발견되었다" in all_text
+        # TXN003(JPY 100단위 나누기 누락)은 1단계에서 바로 걸리는 대표 이상치라
+        # Exception 표에 반드시 나타나야 한다.
+        assert "TXN003" in all_text
+        # 계정별원장 대사에서 걸리는 외환차익(907) 계정 불일치도 나타나야 한다
+        # (Exception 표의 식별자는 계정코드가 아닌 계정과목명을 사용).
+        assert "외환차익" in all_text
+
+    def test_conclusion_wording_when_no_material_difference(self, tmp_path):
+        empty_journal = pd.DataFrame(columns=["전표번호(거래ID)", "일자", "구분", "계정코드",
+                                               "계정과목", "차변금액", "대변금액", "통화",
+                                               "외화금액", "적용환율", "거래처"])
+        empty_settlements = fxp.extract_settlement_transactions(empty_journal)
+        screened = fxp.screen_fx_settlements(empty_settlements)
+        ref_check = fxp.detect_reference_date_mismatch(empty_settlements)
+        verified = fxp.verify_with_evidence(screened)
+        ye_result = fxp.verify_yearend_translation(
+            pd.DataFrame(columns=["거래ID", "통화", "외화금액", "회사적용환율(기말)"]),
+            pd.DataFrame(columns=["전표번호(거래ID)", "통화", "기말미결제외화잔액"]),
+            "2025-12-31",
+        )
+        empty = pd.DataFrame()
+        agg = {"AMPT": 3000000, "순차이합계(KRW)": 0, "절대값차이합계(KRW)": 0,
+               "중요성초과여부": False, "판정": "전체 적정(합계 중요성 이내)", "확인불가건수": 0}
+
+        output_path = tmp_path / "감사조서_정상.docx"
+        fxp.generate_audit_workpaper(
+            str(output_path),
+            screened=screened, agg=agg, ref_check=ref_check, verified=verified,
+            ye_result=ye_result, ledger_result=empty, rollforward_result=empty,
+            year_end_date="2025-12-31",
+        )
+
+        import docx
+        doc = docx.Document(str(output_path))
+        all_text = "\n".join(p.text for p in doc.paragraphs)
+        assert "중요한 차이는 발견되지 않았다" in all_text
+        assert "Exception으로 식별된 건은 없다" in all_text

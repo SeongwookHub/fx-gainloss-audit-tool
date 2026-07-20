@@ -5,10 +5,12 @@
 # 실제 회사 데이터/증빙 - evidence 폴더는 샘플만 커밋, 실제 스캔본은 절대 올리지 말 것
 evidence/*
 !evidence/TXN002_sample.png
+!evidence/OCR_TEST_001.png
 !evidence/.gitkeep
 
 # 로컬 실행 시 생성되는 기본 결과 파일 (데모용 예시는 sample_data/에 별도로 커밋)
 /검증결과.xlsx
+/감사조서_외환차손익.docx
 
 # Python
 __pycache__/
