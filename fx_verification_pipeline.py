@@ -30,6 +30,7 @@ import re
 import json
 import time
 import base64
+import argparse
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -51,9 +52,15 @@ TOLERANCE_PCT = 0.05          # 1단계 이상치 판단 기준: 괴리율 5%
 GAIN_LOSS_TOLERANCE_KRW = 1000  # 재계산 금액과 회사 계상액의 허용 오차(원 단위 반올림 차이)
 AMPT = float(os.environ.get("FX_AMPT", 3000000))  # 허용가능 오류금액(Tolerable Misstatement) - 감사팀 산정치로 교체
 
-CUR_UNIT_MAP = {"USD": "USD", "JPY": "JPY(100)", "EUR": "EUR", "CNH": "CNH"}
+CUR_UNIT_MAP = {
+    "USD": "USD", "JPY": "JPY(100)", "EUR": "EUR", "CNH": "CNH", "CNY": "CNH",
+    "GBP": "GBP", "HKD": "HKD", "CHF": "CHF", "CAD": "CAD", "AUD": "AUD", "SGD": "SGD",
+}
+# 수출입은행 API가 100단위로 고시하는 통화 (JPY 외 확인되는 대로 추가)
+HUNDRED_UNIT_CURRENCIES = {"JPY"}
 
 EVIDENCE_DIR = "evidence"      # 증빙 이미지 폴더
+CLAUDE_MODEL = os.environ.get("FX_CLAUDE_MODEL", "claude-sonnet-4-6")  # 2단계 증빙 OCR용
 
 _rate_cache = {}
 
@@ -118,8 +125,17 @@ def get_official_rate(date_obj: datetime, cur_unit: str, max_lookback_days: int 
 
 
 def normalize_rate(raw_rate: float, currency: str) -> float:
-    """JPY는 100엔당 고시이므로 1엔당 단가로 환산."""
-    return raw_rate / 100 if currency == "JPY" else raw_rate
+    """100단위로 고시되는 통화(JPY 등)는 1단위당 단가로 환산."""
+    return raw_rate / 100 if currency in HUNDRED_UNIT_CURRENCIES else raw_rate
+
+
+def resolve_cur_unit(currency: str) -> tuple:
+    """CUR_UNIT_MAP에 등록되지 않은 통화코드를 만나면, 원 코드를 그대로 시도는 하되
+    (수출입은행 API 코드와 우연히 일치할 수도 있으므로) 경고 메시지를 함께 반환한다.
+    호출부는 경고가 있으면 결과 행에 '통화코드 매핑 미등록'을 명확히 표시해야 한다."""
+    if currency in CUR_UNIT_MAP:
+        return CUR_UNIT_MAP[currency], None
+    return currency, f"통화코드 매핑 미등록({currency}) - CUR_UNIT_MAP 확인 필요"
 
 
 # ------------------------------------------------------------------
@@ -170,6 +186,12 @@ def _normalize_account_code(code) -> str:
         return str(int(float(str(code).strip())))
     except (ValueError, TypeError):
         return str(code).strip()
+
+
+SETTLEMENT_COLUMNS = [
+    "거래ID", "결제일", "통화", "구분", "거래처", "데이터무결성경고",
+    "외화금액", "결제원화금액", "발생원화금액", "회사적용환율(내재)", "회사계상_외환차익차손",
+]
 
 
 def extract_settlement_transactions(journal_df: pd.DataFrame) -> pd.DataFrame:
@@ -249,6 +271,13 @@ def extract_settlement_transactions(journal_df: pd.DataFrame) -> pd.DataFrame:
             "회사계상_외환차익차손": booked_gain_loss,
         })
 
+    if not records:
+        # 이번 기간에 결제 건이 하나도 없어도(연중 미결제 건만 있는 회사 등), 다운스트림이
+        # 기대하는 컬럼과 '결제일'의 datetime dtype을 유지해야 이후 merge에서 안전하다.
+        empty = pd.DataFrame(columns=SETTLEMENT_COLUMNS)
+        empty["결제일"] = pd.to_datetime(empty["결제일"])
+        return empty
+
     return pd.DataFrame(records)
 
 
@@ -284,11 +313,36 @@ def screen_fx_settlements(settlements: pd.DataFrame) -> pd.DataFrame:
     1) 공식 매매기준율과의 '괴리율'을 계산해 5% 초과 건을 개별 플래그
     2) 공식환율 기준으로 재계산한 외환차손익과 회사 계상액의 '금액 차이(KRW)'도 함께 산출
        (개별로는 5% 이내라도, 이 금액 차이들을 합산해 중요성 검토를 하기 위함)
-    회사측 환율은 실제 분개 금액에서 역산한 내재환율(원 단위, 정규화 불필요)을 사용."""
+    회사측 환율은 실제 분개 금액에서 역산한 내재환율(원 단위, 정규화 불필요)을 사용.
+    이번 기간에 결제 건이 하나도 없어도(연중 미결제 건만 있는 회사 등), 컬럼이 통째로
+    빠진 DataFrame을 반환하면 다운스트림(엑셀 내보내기 등)이 깨지므로 컬럼 구조를 유지한다."""
+    if settlements.empty:
+        # concat으로 이어붙여야 settlements의 기존 컬럼 dtype(특히 '결제일'의 datetime64)이
+        # 유지된다 - columns=[...]로 새로 만들면 전부 object dtype이 되어, 이후
+        # build_fx_detail_report의 결제일 기준 merge에서 dtype 불일치 오류가 난다.
+        extra = pd.DataFrame(columns=[
+            "공식매매기준율", "공식환율기준일", "괴리율(%)", "1차플래그",
+            "재계산_외환차손익(공식환율기준)", "회사계상액과의차이(KRW)", "비고",
+        ])
+        return pd.concat([settlements.reset_index(drop=True), extra], axis=1)
+
     results = []
     for _, row in settlements.iterrows():
-        cur_unit = CUR_UNIT_MAP.get(row["통화"], row["통화"])
-        official_raw, actual_date = get_official_rate(row["결제일"], cur_unit)
+        cur_unit, cur_warning = resolve_cur_unit(row["통화"])
+        try:
+            official_raw, actual_date = get_official_rate(row["결제일"], cur_unit)
+        except ValueError as e:
+            # 환율을 못 찾은 거래 한 건 때문에 배치 전체가 죽지 않도록, 이 건만
+            # '오류' 플래그로 남기고 나머지 거래는 계속 검증한다.
+            results.append({
+                **row.to_dict(),
+                "공식매매기준율": None, "공식환율기준일": None, "괴리율(%)": None,
+                "1차플래그": "오류(환율조회실패)",
+                "재계산_외환차손익(공식환율기준)": None, "회사계상액과의차이(KRW)": None,
+                "비고": cur_warning or str(e),
+            })
+            continue
+
         official_rate = normalize_rate(official_raw, row["통화"])
         company_rate = row["회사적용환율(내재)"]
 
@@ -313,6 +367,7 @@ def screen_fx_settlements(settlements: pd.DataFrame) -> pd.DataFrame:
             "1차플래그": "이상치(정밀검증필요)" if flagged else "적정(스크리닝통과)",
             "재계산_외환차손익(공식환율기준)": round(recalculated_gain_loss),
             "회사계상액과의차이(KRW)": round(diff_krw),
+            "비고": cur_warning,
         })
     return pd.DataFrame(results)
 
@@ -374,9 +429,13 @@ def check_aggregate_materiality(screened: pd.DataFrame, ampt: float) -> dict:
     """개별 건이 전부 5% 이내로 통과했더라도, 재계산액과 회사계상액의 차이를
     전체 합산했을 때 AMPT(허용가능 오류금액)를 넘는지 확인.
     순합계(넷)와 절대값합계(그로스) 둘 다 보여줌 - 방향이 서로 반대인 오류가
-    상쇄되어 순합계는 작아 보여도 그로스 기준으로는 클 수 있기 때문."""
-    net_sum = screened["회사계상액과의차이(KRW)"].sum()
-    gross_sum = screened["회사계상액과의차이(KRW)"].abs().sum()
+    상쇄되어 순합계는 작아 보여도 그로스 기준으로는 클 수 있기 때문.
+    환율조회 실패 등으로 차이금액을 못 구한 행(None)은 합계에서 제외하고
+    건수만 별도로 집계한다 - 조용히 누락시키지 않고 존재를 드러내기 위함."""
+    diffs = pd.to_numeric(screened["회사계상액과의차이(KRW)"], errors="coerce")
+    unresolved_count = int(diffs.isna().sum())
+    net_sum = diffs.sum()
+    gross_sum = diffs.abs().sum()
     breach = abs(net_sum) > ampt or gross_sum > ampt
 
     return {
@@ -385,6 +444,7 @@ def check_aggregate_materiality(screened: pd.DataFrame, ampt: float) -> dict:
         "절대값차이합계(KRW)": round(gross_sum),
         "중요성초과여부": breach,
         "판정": "전체 재검토 필요(합계 중요성 초과)" if breach else "전체 적정(합계 중요성 이내)",
+        "확인불가건수": unresolved_count,
     }
 
 
@@ -436,15 +496,31 @@ def detect_reference_date_mismatch(settlements: pd.DataFrame) -> pd.DataFrame:
     표시하고 그 날짜를 함께 보여준다. 5% 이내로 통과한 건도 전부 검사 대상.
     (거래당 API 호출을 최대 8회 내외로 제한 - 이전 버전은 최대 40회까지 순차 호출해서
     수출입은행 서버의 사실상 레이트리밋에 걸렸었음)"""
+    if settlements.empty:
+        return pd.DataFrame(columns=["거래ID", "결제일", "회사적용환율(내재)", "기준일판정", "추정사용일자"])
+
     results = []
     for _, row in settlements.iterrows():
-        cur_unit = CUR_UNIT_MAP.get(row["통화"], row["통화"])
+        cur_unit, cur_warning = resolve_cur_unit(row["통화"])
         company_rate = row["회사적용환율(내재)"]
         settle_date = row["결제일"]
 
+        if cur_warning:
+            results.append({
+                "거래ID": row["거래ID"], "결제일": settle_date.strftime("%Y-%m-%d"),
+                "회사적용환율(내재)": company_rate, "기준일판정": f"확인불가({cur_warning})",
+                "추정사용일자": None,
+            })
+            continue
+
         matched_date = None
         for candidate_date in _candidate_wrong_dates(settle_date):
-            rate_table = fetch_rates_for_date(candidate_date.strftime("%Y%m%d"))
+            try:
+                rate_table = fetch_rates_for_date(candidate_date.strftime("%Y%m%d"))
+            except ValueError:
+                # 이 후보 날짜만 건너뛴다 - 바로 다음의 get_official_rate 호출에서
+                # 같은 원인(키 오류 등)이면 그때 이 거래 전체를 '확인불가'로 남긴다.
+                continue
             if cur_unit not in rate_table:
                 continue
             candidate_rate = normalize_rate(rate_table[cur_unit], row["통화"])
@@ -454,7 +530,15 @@ def detect_reference_date_mismatch(settlements: pd.DataFrame) -> pd.DataFrame:
                 matched_date = candidate_date
                 break
 
-        official_settle_raw, _ = get_official_rate(settle_date, cur_unit)
+        try:
+            official_settle_raw, _ = get_official_rate(settle_date, cur_unit)
+        except ValueError as e:
+            results.append({
+                "거래ID": row["거래ID"], "결제일": settle_date.strftime("%Y-%m-%d"),
+                "회사적용환율(내재)": company_rate, "기준일판정": f"확인불가(환율조회실패: {e})",
+                "추정사용일자": None,
+            })
+            continue
         official_settle_rate = normalize_rate(official_settle_raw, row["통화"])
         already_matches_settle_date = (
             official_settle_rate != 0 and
@@ -520,7 +604,7 @@ def extract_rate_from_evidence(image_path: str) -> dict:
     )
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=CLAUDE_MODEL,
         max_tokens=500,
         messages=[{"role": "user", "content": [content_block, {"type": "text", "text": prompt}]}],
     )
@@ -534,7 +618,12 @@ def extract_rate_from_evidence(image_path: str) -> dict:
 
 
 def verify_with_evidence(flagged_df: pd.DataFrame) -> pd.DataFrame:
-    """1단계에서 플래그된 건에 대해 증빙 파일이 있으면 OCR로 검증, 없으면 '증빙요청필요' 표시."""
+    """1단계에서 플래그된 건에 대해 증빙 파일이 있으면 OCR로 검증, 없으면 '증빙요청필요' 표시.
+    정밀검증 대상이 0건(이상치가 하나도 없는 정상적인 기간)이어도, 호출부가 기대하는
+    컬럼이 빠지지 않도록 빈 DataFrame에도 컬럼 구조를 유지해서 반환한다."""
+    if flagged_df.empty:
+        return pd.DataFrame(columns=list(flagged_df.columns) + ["증빙상태", "증빙확인환율", "최종판정"])
+
     rows = []
     for _, row in flagged_df.iterrows():
         record = row.to_dict()
@@ -547,7 +636,17 @@ def verify_with_evidence(flagged_df: pd.DataFrame) -> pd.DataFrame:
             rows.append(record)
             continue
 
-        extracted = extract_rate_from_evidence(evidence_path)
+        try:
+            extracted = extract_rate_from_evidence(evidence_path)
+        except Exception as e:
+            # ANTHROPIC_API_KEY 미설정/만료, 네트워크 오류 등으로 OCR 호출 자체가 실패해도
+            # 이 거래만 '수기 확인 필요'로 남기고 나머지 거래 검증은 계속 진행한다.
+            record["증빙상태"] = "OCR 호출 실패 - 수기 확인 필요"
+            record["증빙확인환율"] = None
+            record["최종판정"] = f"미확인(OCR 호출 오류: {e})"
+            rows.append(record)
+            continue
+
         if "error" in extracted:
             record["증빙상태"] = "OCR 인식 실패 - 수기 확인 필요"
             record["증빙확인환율"] = None
@@ -579,13 +678,26 @@ def verify_with_evidence(flagged_df: pd.DataFrame) -> pd.DataFrame:
 # 5. 외화환산손익 (기말평가) - 전수 자동 검증
 # ------------------------------------------------------------------
 
+YEAREND_RESULT_COLUMNS = ["거래ID", "결산일", "통화", "외화금액", "회사적용환율(기말)", "공식결산환율", "일치여부"]
+
+
 def verify_yearend_translation(ye_df: pd.DataFrame, missing_df: pd.DataFrame, year_end_date: str) -> pd.DataFrame:
+    if ye_df.empty and missing_df.empty:
+        return pd.DataFrame(columns=YEAREND_RESULT_COLUMNS)
+
     rows = []
     ye_dt = pd.to_datetime(year_end_date)
 
     for _, row in ye_df.iterrows():
-        cur_unit = CUR_UNIT_MAP.get(row["통화"], row["통화"])
-        official_raw, actual_date = get_official_rate(ye_dt, cur_unit)
+        cur_unit, cur_warning = resolve_cur_unit(row["통화"])
+        if cur_warning:
+            rows.append({**row.to_dict(), "공식결산환율": None, "일치여부": f"확인불가({cur_warning})"})
+            continue
+        try:
+            official_raw, actual_date = get_official_rate(ye_dt, cur_unit)
+        except ValueError as e:
+            rows.append({**row.to_dict(), "공식결산환율": None, "일치여부": f"확인불가(환율조회실패: {e})"})
+            continue
         official_rate = normalize_rate(official_raw, row["통화"])
         company_rate = normalize_rate(row["회사적용환율(기말)"], row["통화"]) if row["통화"] == "JPY" else row["회사적용환율(기말)"]
 
@@ -1129,6 +1241,7 @@ def export_results_to_excel(output_path: str, *, counterparty_summary, rate_tren
         ("순차이합계(KRW)", agg["순차이합계(KRW)"], AMOUNT_FORMAT),
         ("절대값차이합계(KRW)", agg["절대값차이합계(KRW)"], AMOUNT_FORMAT),
         ("판정", agg["판정"], None),
+        ("확인불가건수(환율조회실패 등)", agg["확인불가건수"], INT_FORMAT),
     ]
     for label, value, fmt in summary_rows:
         ws0.append([label, value])
@@ -1163,10 +1276,28 @@ def export_results_to_excel(output_path: str, *, counterparty_summary, rate_tren
 # 7. 실행
 # ------------------------------------------------------------------
 
-if __name__ == "__main__":
-    journal = load_journal("분개장.xlsx")
-    schedule = pd.read_excel("명세서_외화자산부채명세서.xlsx")
-    ledger = pd.read_excel("계정별원장.xlsx")
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="외환차손익/외화환산손익 검증 파이프라인. 인자 없이 실행하면 sample_data/의 "
+                     "샘플 분개장·명세서·계정별원장을 대상으로 동작합니다."
+    )
+    parser.add_argument("--journal", default="sample_data/분개장.xlsx", help="분개장 엑셀 경로")
+    parser.add_argument("--schedule", default="sample_data/명세서_외화자산부채명세서.xlsx",
+                         help="외화자산부채명세서 엑셀 경로")
+    parser.add_argument("--ledger", default="sample_data/계정별원장.xlsx", help="계정별원장 엑셀 경로")
+    parser.add_argument("--year-end-date", default="2025-12-31", help="결산일 (YYYY-MM-DD)")
+    parser.add_argument("--output", default="검증결과.xlsx", help="결과 엑셀 저장 경로")
+    parser.add_argument("--ampt", type=float, default=AMPT,
+                         help="허용가능 오류금액(Tolerable Misstatement). 기본값은 FX_AMPT 환경변수")
+    return parser
+
+
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+
+    journal = load_journal(args.journal)
+    schedule = pd.read_excel(args.schedule)
+    ledger = pd.read_excel(args.ledger)
 
     # 0단계: 실무 감사 절차와 동일하게, 거래 하나하나를 보기 전에
     # 거래처별 연간 요약 + 월별 환율 추이부터 확인한다.
@@ -1190,7 +1321,7 @@ if __name__ == "__main__":
                      "1차플래그", "회사계상액과의차이(KRW)"]])
 
     print("\n=== A-보조. 합계 중요성 검증 (개별 통과 건 포함 전체 합산) ===")
-    agg = check_aggregate_materiality(screened, AMPT)
+    agg = check_aggregate_materiality(screened, args.ampt)
     print(agg)
 
     print("\n=== A-보조2. 결제일-환율기준일 불일치 탐지 (5% 통과 건 포함 전수 검사) ===")
@@ -1209,7 +1340,7 @@ if __name__ == "__main__":
     print("\n=== B. 외화환산손익 전수 검증 ===")
     ye_txns = extract_yearend_transactions(journal)
     missing_ye = get_unsettled_yearend_candidates(journal, schedule)
-    ye_result = verify_yearend_translation(ye_txns, missing_ye, "2025-12-31")
+    ye_result = verify_yearend_translation(ye_txns, missing_ye, args.year_end_date)
     print(ye_result[["거래ID", "통화", "일치여부"]])
 
     print("\n=== C. 계정별원장 대사 (분개장 <-> 총계정원장 교차검증) ===")
@@ -1223,9 +1354,13 @@ if __name__ == "__main__":
     full_detail = build_full_journal_detail(journal, screened, ye_result)
 
     export_results_to_excel(
-        "검증결과.xlsx",
+        args.output,
         counterparty_summary=counterparty_summary, rate_trend=rate_trend,
         screened=screened, agg=agg, ref_check=ref_check, verified=verified,
         ye_result=ye_result, ledger_result=ledger_result, rollforward_result=rollforward_result,
         full_detail=full_detail,
     )
+
+
+if __name__ == "__main__":
+    main()
