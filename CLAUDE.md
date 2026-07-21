@@ -27,7 +27,9 @@ python fx_verification_pipeline.py \
   --ledger 계정별원장.xlsx \
   --year-end-date 2025-12-31 \
   --output 검증결과.xlsx \
-  --ampt 3000000
+  --ampt 3000000 \
+  --workpaper \
+  --workpaper-output 감사조서_외환차손익.docx
 
 pytest                                   # full test suite (no network calls; APIs are monkeypatched)
 pytest tests/test_fx_verification_pipeline.py::TestCheckAggregateMateriality  # single test class
@@ -37,7 +39,7 @@ pytest tests/test_fx_verification_pipeline.py -k reference_date               # 
 Required env vars for a real (non-mocked) run: `EXIM_AUTH_KEY` (한국수출입은행 Open API — official
 매매기준율) and `ANTHROPIC_API_KEY` (Claude Vision, only needed for stage-2 evidence OCR). Optional:
 `FX_AMPT` (default 3,000,000, overridden by `--ampt`), `FX_CLAUDE_MODEL` (default
-`claude-sonnet-4-6`).
+`claude-sonnet-4-6`), `FX_OCR_RECHECK_RATE` (default 0.15 — QC recheck sample rate, see below).
 
 Regenerate sample/demo fixtures: `python generate_samples.py` (writes `sample_data/*.xlsx` with
 real historical rates baked into `TestSampleDataOracle`'s `SAMPLE_FAKE_RATES` — if you regenerate
@@ -96,6 +98,27 @@ deviation %, and materiality rollup is plain arithmetic.
    a multi-sheet workbook (안내/요약/A~E, see README "결과 엑셀 시트 구성"), auto-color-coding rows
    via keyword matching (`FLAG_KEYWORDS`/`OK_KEYWORDS` in `_row_status`) and sorting flagged rows
    to the top.
+8. **Audit workpaper (optional, `--workpaper`)** — `generate_audit_workpaper()` writes a Word
+   doc (목적 → 대상 → 절차 → 결과 → 결론) from the *same* already-computed results
+   (`screened`/`agg`/`ye_result`/`ledger_result`/`rollforward_result`, etc.) used for the Excel
+   export. It must not make any new judgment call (materiality breach, 적정/부적정 verdict) —
+   it only quotes strings/flags the pipeline already produced (`_row_status`/`FLAG_KEYWORDS`,
+   same rule the Excel highlighting uses). If a new "결과" fact needs to appear in the workpaper,
+   compute it upstream in the pipeline and pass it in, don't derive it inside this function.
+
+### OCR recheck sample (QC)
+
+`_select_ocr_recheck_sample()` (called from `verify_with_evidence`) flags a subset of rows OCR
+judged "적정(증빙과 일치)" as `OCR재확인표본`, so an auditor can spot-check for OCR false
+negatives (OCR said "matches" when it didn't) — rows OCR already flagged as mismatched are 100%
+reviewed via Exception, so they're excluded here. Sample size is
+`ceil(len(matched) * OCR_RECHECK_SAMPLE_RATE)`. Reproducibility is **transaction-ID hash-based, not
+a global/list-order seed**: `_ocr_recheck_hash_key()` runs `sha256(f"{seed}:{거래ID}")` per row,
+`matched` is sorted by that hash, and the top N are sampled. This is deliberate — seeding
+`random.Random(seed).sample(matched, n)` on the list itself would make the result depend on
+`matched`'s order/composition, so an unrelated upstream change (new filter, reordering) could
+silently reshuffle which 거래ID were previously sampled. Hashing the ID directly keeps a given
+거래ID's sampled/not-sampled outcome stable regardless of what else is in `matched`.
 
 ### Robustness pattern used throughout
 
@@ -114,7 +137,8 @@ it preserves dtypes, unlike `pd.DataFrame(columns=[...])`).
 
 ### Currency unit handling
 
-한국수출입은행 API quotes some currencies per 100 units (currently only JPY, see
+`CUR_UNIT_MAP` currently covers USD, JPY, EUR, CNH (CNY is aliased to CNH), GBP, HKD, CHF, CAD,
+AUD, SGD. 한국수출입은행 API quotes some currencies per 100 units (currently only JPY, see
 `HUNDRED_UNIT_CURRENCIES`). `resolve_cur_unit()` / `normalize_rate()` handle this; a currency not
 present in `CUR_UNIT_MAP` is never silently mismapped — it produces an explicit "통화코드 매핑
 미등록" warning on the row instead.
@@ -134,8 +158,24 @@ intentionally not fully automatic.
   replaced with `_FakeAnthropicClient`/`_FakeMessages`/`_FakeMessage`/`_FakeTextBlock`.
   `tests/conftest.py` only adds the repo root to `sys.path`.
 - `TestSampleDataOracle` is the end-to-end regression test: it runs the pipeline against
-  `sample_data/` and checks every one of the 8 sample transactions (TXN001-008) against the
-  documented verdicts in `sample_data/검증포인트_참고용.xlsx` / README "샘플 데이터" — 3 clean
-  cases must produce no false positive, 5 seeded-error cases must all be flagged.
+  `sample_data/` and checks every one of the 14 sample transactions (TXN001-014) against the
+  documented verdicts in `sample_data/검증포인트_참고용.xlsx` / README "샘플 데이터" — clean
+  cases must produce no false positive, seeded-error cases must all be flagged. TXN001-008 are the
+  original set (`generate_samples.py`'s `SAMPLE_FAKE_RATES`-mirrored real historical rates);
+  TXN009-014 extend it with split settlements, the newer currencies (GBP/HKD/CHF/CAD/AUD/SGD), and
+  two stage-2 OCR cases (TXN011 resolves to "정상" via evidence, TXN013 stays "오류" via evidence) —
+  see `evidence/TXN011.png`/`evidence/TXN013.png`.
+- `TestMessySampleEndToEnd` runs the full pipeline against all three `robustness_test/messy_*.xlsx`
+  files together (not just `messy_분개장.xlsx`), asserting it completes without raising and that the
+  TXN101/105 duplicate-voucher-number data-integrity warning fires.
+- `scripts/demo_account_mapping_and_voucher_numbering.py` shows how to call
+  `build_account_mapping()`/`apply_account_mapping()`/`auto_assign_voucher_number()` — none of
+  these are wired into `main()`/the CLI (see "Account mapping is a manual-in-the-loop step" above),
+  so this is the only place that exercises them end-to-end. Its test
+  (`TestDemoAccountMappingAndVoucherNumberingScript`) loads the script as a module and asserts on
+  the actual return values, not console output.
 - pandas/numpy booleans from filter expressions are `np.True_`/`np.False_`, not Python `True`/
   `False` — assert on truthiness (`assert x`, `assert not x`), not identity (`is True`).
+- `tests/generate_ocr_test_sample.py` and `tests/manual_ocr_check.py` are intentionally outside the
+  pytest suite — they call the real Claude Vision API. Use them for manual regression checks after
+  touching the OCR prompt; never wire them into `pytest`/CI.

@@ -124,6 +124,44 @@ class TestAutoAssignVoucherNumber:
             fxp.auto_assign_voucher_number(df)
 
 
+class TestDemoAccountMappingAndVoucherNumberingScript:
+    """scripts/demo_account_mapping_and_voucher_numbering.py는 build_account_mapping/
+    apply_account_mapping/auto_assign_voucher_number - main()/CLI에 안 붙어있어 --workpaper
+    한 번으로는 못 보여주는 두 '수동 개입' 기능 - 을 실제로 어떻게 호출하는지 보여주는
+    데모다. 콘솔 출력이 아니라 함수가 실제로 반환하는 값을 assert한다."""
+
+    @staticmethod
+    def _load_demo_module():
+        import importlib.util
+        script_path = ROOT_DIR / "scripts" / "demo_account_mapping_and_voucher_numbering.py"
+        spec = importlib.util.spec_from_file_location("demo_account_mapping_and_voucher_numbering", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_account_mapping_demo_auto_confirms_and_flags_ambiguous(self):
+        demo = self._load_demo_module()
+        mapping_result, confirmed_mapping, mapped = demo.demo_account_mapping()
+
+        by_code = mapping_result.set_index("회사계정코드")
+        assert by_code.loc["1081", "상태"] == "자동확정"
+        assert by_code.loc["1081", "추천표준분류"] == "108"
+        assert by_code.loc["9999", "상태"] == "확인필요(매칭 없음)"
+
+        # 사람이 "9999"(달러채권)를 108로 확정했다고 가정한 뒤 적용한 결과가 실제로 반영됐는지.
+        assert confirmed_mapping["9999"] == "108"
+        mapped_by_orig = mapped.set_index("원본계정코드")
+        assert mapped_by_orig.loc["9999", "계정코드"] == "108"
+        assert mapped_by_orig.loc["9999", "계정과목"] == "외상매출금(외화)"
+
+    def test_voucher_numbering_demo_assigns_balanced_groups(self):
+        demo = self._load_demo_module()
+        result = demo.demo_auto_voucher_numbering()
+        assert list(result["전표번호(거래ID)"]) == [
+            "AUTO00001", "AUTO00001", "AUTO00002", "AUTO00002",
+        ]
+
+
 # ------------------------------------------------------------------
 # 지저분한 원본 파일 대응 (robustness_test/messy_*.xlsx 재사용)
 # ------------------------------------------------------------------
@@ -139,6 +177,87 @@ class TestLoadJournalRobustness:
             assert col in df.columns
         # 계정코드는 전부 문자열로 정규화되어야 한다 ("108.0" 같은 형태가 남아있으면 안 됨).
         assert df["계정코드"].apply(lambda v: not str(v).endswith(".0")).all()
+
+
+class TestMessySampleEndToEnd:
+    """messy_분개장.xlsx뿐 아니라 messy_명세서_외화자산부채명세서.xlsx/messy_계정별원장.xlsx까지
+    묶어서, 지저분한 3파일 세트 전체가 파이프라인을 끝까지 죽지 않고 통과하는지 확인한다.
+    (messy_분개장.xlsx만 헤더 자동인식 대상이고, 명세서/원장은 1행이 곧바로 헤더라 지금
+    로더로도 바로 읽힌다 - generate_messy_sample.py 확인 결과.) TXN101/105 조합으로 재현된
+    전표번호 중복 오채번의 데이터 무결성 경고도 함께 확인한다."""
+
+    @pytest.fixture
+    def messy_inputs(self):
+        journal_path = ROBUST_DIR / "messy_분개장.xlsx"
+        schedule_path = ROBUST_DIR / "messy_명세서_외화자산부채명세서.xlsx"
+        ledger_path = ROBUST_DIR / "messy_계정별원장.xlsx"
+        if not (journal_path.exists() and schedule_path.exists() and ledger_path.exists()):
+            pytest.skip("robustness_test/messy_*.xlsx 3종 세트가 없음")
+        journal = fxp.load_journal(str(journal_path))
+        schedule = pd.read_excel(schedule_path)
+        ledger = pd.read_excel(ledger_path)
+        return journal, schedule, ledger
+
+    def test_full_pipeline_survives_messy_three_file_set(self, messy_inputs, monkeypatch):
+        journal, schedule, ledger = messy_inputs
+
+        # messy 샘플 자체의 환율(TXN101~109)만 있으면 되므로, 못 찾는 날짜는 그냥 빈 값으로
+        # 둬서 "확인불가/오류"로 우아하게 처리되는지도 같이 확인한다(전부 맞출 필요 없음).
+        monkeypatch.setattr(fxp, "fetch_rates_for_date", _make_fake_fetch({}))
+
+        settlements = fxp.extract_settlement_transactions(journal)
+        screened = fxp.screen_fx_settlements(settlements)
+        ref_check = fxp.detect_reference_date_mismatch(settlements)
+        agg = fxp.check_aggregate_materiality(screened, ampt=3000000)
+
+        ye_txns = fxp.extract_yearend_transactions(journal)
+        missing_ye = fxp.get_unsettled_yearend_candidates(journal, schedule)
+        ye_result = fxp.verify_yearend_translation(ye_txns, missing_ye, "2025-12-31")
+
+        ledger_result = fxp.verify_ledger_reconciliation(journal, ledger)
+        rollforward_result = fxp.build_rollforward_verification(journal, schedule, screened)
+
+        # 전체 체인이 예외 없이 끝까지 돌고, 각 단계가 빈 결과를 내지 않아야 한다.
+        assert not settlements.empty
+        assert not screened.empty
+        assert not ref_check.empty
+        assert agg is not None
+        assert not ledger_result.empty
+        assert not rollforward_result.empty
+
+        # TXN101 발생 라인에 EUR/Munich Parts AG 거래가 오채번으로 섞여 있으므로
+        # (통화·거래처가 다른 발생 라인 2건 이상) 데이터 무결성 경고가 떠야 한다.
+        warning = settlements.loc[settlements["거래ID"] == "TXN101", "데이터무결성경고"]
+        assert warning.notna().any()
+        assert "전표번호 중복 의심" in warning.dropna().iloc[0]
+
+    def test_workpaper_generation_survives_messy_input(self, messy_inputs, monkeypatch, tmp_path):
+        """--workpaper까지 포함해 지저분한 입력으로도 감사조서 생성 자체가 죽지 않는지 확인."""
+        journal, schedule, ledger = messy_inputs
+        monkeypatch.setattr(fxp, "fetch_rates_for_date", _make_fake_fetch({}))
+        monkeypatch.setattr(fxp, "EVIDENCE_DIR", str(tmp_path / "no_evidence"))
+
+        settlements = fxp.extract_settlement_transactions(journal)
+        screened = fxp.screen_fx_settlements(settlements)
+        ref_check = fxp.detect_reference_date_mismatch(settlements)
+        agg = fxp.check_aggregate_materiality(screened, ampt=3000000)
+        verified = fxp.verify_with_evidence(screened)
+
+        ye_txns = fxp.extract_yearend_transactions(journal)
+        missing_ye = fxp.get_unsettled_yearend_candidates(journal, schedule)
+        ye_result = fxp.verify_yearend_translation(ye_txns, missing_ye, "2025-12-31")
+
+        ledger_result = fxp.verify_ledger_reconciliation(journal, ledger)
+        rollforward_result = fxp.build_rollforward_verification(journal, schedule, screened)
+
+        output_path = tmp_path / "감사조서_messy_테스트.docx"
+        fxp.generate_audit_workpaper(
+            str(output_path),
+            screened=screened, agg=agg, ref_check=ref_check, verified=verified,
+            ye_result=ye_result, ledger_result=ledger_result,
+            rollforward_result=rollforward_result, year_end_date="2025-12-31",
+        )
+        assert output_path.exists()
 
 
 # ------------------------------------------------------------------
@@ -190,6 +309,19 @@ class TestScreenFxSettlements:
         assert len(result) == 2
         assert (result["1차플래그"] == "오류(환율조회실패)").all()
         assert result["공식매매기준율"].isna().all()
+
+    def test_unmapped_currency_skips_rate_lookup_entirely(self, monkeypatch):
+        # CUR_UNIT_MAP에 없는 통화는 detect_reference_date_mismatch/verify_yearend_translation과
+        # 동일하게, API가 우연히 받아줄 수 있어도 조회 자체를 하지 않고 확인불가로 남겨야 한다.
+        def _fail_if_called(date_str, _retries=2):
+            raise AssertionError("미등록 통화는 fetch_rates_for_date가 호출되면 안 된다")
+
+        monkeypatch.setattr(fxp, "fetch_rates_for_date", _fail_if_called)
+        settlements = pd.DataFrame([_settlement_row(통화="XYZ")])
+        result = fxp.screen_fx_settlements(settlements)
+        assert result.iloc[0]["1차플래그"].startswith("확인불가")
+        assert result.iloc[0]["공식매매기준율"] is None
+        assert result.iloc[0]["회사계상액과의차이(KRW)"] is None
 
 
 class TestDetectReferenceDateMismatch:
@@ -360,12 +492,12 @@ class TestExtractRateFromEvidenceParsing:
 
 
 # ------------------------------------------------------------------
-# End-to-end 오라클 테스트: sample_data/ 8개 거래를 검증포인트_참고용.xlsx와 대조
+# End-to-end 오라클 테스트: sample_data/ 14개 거래를 검증포인트_참고용.xlsx와 대조
 # ------------------------------------------------------------------
 
-# generate_samples.py에 기록된 실제 매매기준율(당시 수출입은행 API 조회값)을 그대로 재현한
-# 오프라인 환율표. 다른 후보일자(전월말/전영업일 등)는 의도적으로 비워둬 candidate 탐색이
-# '매칭 없음'으로 안전하게 종료되는지도 같이 검증한다.
+# generate_samples.py에 기록된 실제/설계 매매기준율을 그대로 재현한 오프라인 환율표.
+# 다른 후보일자(전월말/전영업일 등)는 의도적으로 비워둬 candidate 탐색이 '매칭 없음'으로
+# 안전하게 종료되는지도 같이 검증한다.
 SAMPLE_FAKE_RATES = {
     "20250425": {"USD": 1430.20},   # TXN001 결제일
     "20250515": {"USD": 1415.80},   # TXN002 실제 결제일 환율
@@ -373,7 +505,12 @@ SAMPLE_FAKE_RATES = {
     "20250718": {"JPY(100)": 937.73},  # TXN003 결제일
     "20250930": {"USD": 1402.20},   # TXN004 결제일
     "20250611": {"EUR": 1554.64},   # TXN005 결제일
-    "20251231": {"USD": 1434.90},   # 2025 결산일 공식환율 (TXN006/TXN008 판정 기준)
+    "20251231": {"USD": 1434.90, "HKD": 183.50, "SGD": 1065.90},  # 결산일 공식환율 (TXN006/008/010/014 판정 기준)
+    "20250310": {"GBP": 1885.60},   # TXN009 분할결제 1차
+    "20250520": {"GBP": 1901.30},   # TXN009 분할결제 2차
+    "20250605": {"CHF": 1620.00},   # TXN011 결제일 - 회사 계상(1750.00)과 괴리 8%+ (우대환율)
+    "20250702": {"CAD": 1008.40},   # TXN012 결제일
+    "20250814": {"AUD": 918.75},    # TXN013 결제일 - 회사 계상(980.00)이 오류, 증빙과도 다름
 }
 
 
@@ -390,9 +527,9 @@ class TestSampleDataOracle:
         어긋나지 않는지 먼저 확인 - 샘플 데이터가 나중에 바뀌면 이 테스트가 먼저 깨진다."""
         answer_key = pd.read_excel(SAMPLE_DIR / "검증포인트_참고용.xlsx")
         answer_map = dict(zip(answer_key["거래ID"], answer_key["정상/오류"]))
-        for txn in ["TXN002", "TXN003", "TXN004", "TXN007", "TXN008"]:
+        for txn in ["TXN002", "TXN003", "TXN004", "TXN007", "TXN008", "TXN013"]:
             assert answer_map[txn] == "오류", f"{txn}는 오류 케이스여야 함"
-        for txn in ["TXN001", "TXN005", "TXN006"]:
+        for txn in ["TXN001", "TXN005", "TXN006", "TXN009", "TXN010", "TXN011", "TXN012", "TXN014"]:
             assert answer_map[txn] == "정상", f"{txn}는 정상 케이스여야 함"
 
     def test_settlement_screening_matches_expected_flags(self, sample_pipeline_inputs, monkeypatch):
@@ -410,6 +547,17 @@ class TestSampleDataOracle:
         assert screened.loc["TXN004", "1차플래그"] == "적정(스크리닝통과)"
         # TXN003: JPY 100단위 나누기 누락 - 괴리가 커서 1단계에서 바로 걸려야 함
         assert screened.loc["TXN003", "1차플래그"] == "이상치(정밀검증필요)"
+
+        # TXN009: GBP 분할결제 2건 모두 실제 환율대로 정확히 반영 - 둘 다 통과해야 함
+        assert (screened.loc["TXN009", "1차플래그"] == "적정(스크리닝통과)").all()
+        assert len(screened.loc["TXN009"]) == 2
+        # TXN011: CHF, 우대환율로 매매기준율과 괴리가 커서 1단계에서는 이상치로 걸려야 함
+        # (2단계 증빙 OCR에서 최종적으로 적정으로 해소되는 건 TestOcrEvidenceForNewCurrencies에서 확인)
+        assert screened.loc["TXN011", "1차플래그"] == "이상치(정밀검증필요)"
+        # TXN012: CAD, 실제 환율 그대로 정확히 반영 - 통과해야 함
+        assert screened.loc["TXN012", "1차플래그"] == "적정(스크리닝통과)"
+        # TXN013: AUD, 회사가 실제 잘못된 환율을 적용해 1단계에서 이상치로 걸려야 함
+        assert screened.loc["TXN013", "1차플래그"] == "이상치(정밀검증필요)"
 
         # 개별로는 안 걸려도, 합계로 보면 중요성을 초과해야 한다(README가 설명하는 설계 의도).
         agg = fxp.check_aggregate_materiality(screened.reset_index(), ampt=3000000)
@@ -439,6 +587,9 @@ class TestSampleDataOracle:
         assert ye_result.loc["TXN006", "일치여부"] == "적정"
         assert ye_result.loc["TXN008", "일치여부"] == "부적정(환율 오류)"
         assert ye_result.loc["TXN007", "일치여부"] == "부적정(기말평가 누락)"
+        # TXN010(HKD)·TXN014(SGD) - 신규 통화도 기말 재평가가 정상적으로 통과해야 한다
+        assert ye_result.loc["TXN010", "일치여부"] == "적정"
+        assert ye_result.loc["TXN014", "일치여부"] == "적정"
 
     def test_ledger_reconciliation_catches_seeded_adjustment_gap(self, sample_pipeline_inputs):
         journal, _schedule = sample_pipeline_inputs
@@ -451,6 +602,40 @@ class TestSampleDataOracle:
         assert result.loc["957", "일치여부"] == "적정"
         assert result.loc["908", "일치여부"] == "적정"
         assert result.loc["958", "일치여부"] == "적정"
+
+    def test_ocr_evidence_resolves_txn011_and_txn013(self, sample_pipeline_inputs, monkeypatch):
+        """TXN011(CHF, 우대환율)과 TXN013(AUD, 실제 오류)은 evidence/TXN011.png,
+        evidence/TXN013.png가 실제로 존재하는 2단계 증빙 OCR 케이스다. anthropic
+        클라이언트는 호출하지 않고 extract_rate_from_evidence만 목킹해서, 실제
+        증빙 파일 탐색(_find_evidence_file)과 환율 일치/불일치 판정 로직만 확인한다
+        - Claude Vision이 이미지를 실제로 정확히 읽는지는 tests/manual_ocr_check.py
+        (수동, 실 API 호출)의 영역이다."""
+        journal, _schedule = sample_pipeline_inputs
+        monkeypatch.setattr(fxp, "fetch_rates_for_date", _make_fake_fetch(SAMPLE_FAKE_RATES))
+        monkeypatch.setattr(fxp, "EVIDENCE_DIR", str(ROOT_DIR / "evidence"))
+
+        def _fake_extract(image_path):
+            if "TXN011" in image_path:
+                return {"거래일자": "2025-06-05", "통화": "CHF", "적용환율": 1750.00,
+                         "외화금액": 6000.0, "원화금액": 10500000}
+            if "TXN013" in image_path:
+                return {"거래일자": "2025-08-14", "통화": "AUD", "적용환율": 918.75,
+                         "외화금액": 25000.0, "원화금액": 22968750}
+            raise AssertionError(f"예상치 못한 증빙 경로: {image_path}")
+
+        monkeypatch.setattr(fxp, "extract_rate_from_evidence", _fake_extract)
+
+        settlements = fxp.extract_settlement_transactions(journal)
+        screened = fxp.screen_fx_settlements(settlements)
+        flagged = screened[screened["1차플래그"] == "이상치(정밀검증필요)"]
+        verified = fxp.verify_with_evidence(flagged).set_index("거래ID")
+
+        # TXN011: 증빙 환율(1750.00)이 회사 계상 환율과 정확히 일치 -> 적정으로 해소
+        assert verified.loc["TXN011", "증빙상태"] == "증빙 확인 완료"
+        assert verified.loc["TXN011", "최종판정"] == "적정(증빙과 일치)"
+        # TXN013: 증빙 환율(918.75)이 회사가 잘못 계상한 환율(980.00)과 불일치 -> 재확인
+        assert verified.loc["TXN013", "증빙상태"] == "증빙 확인 완료"
+        assert verified.loc["TXN013", "최종판정"] == "부적정(증빙과 불일치 - 재계산 필요)"
 
 
 # ------------------------------------------------------------------

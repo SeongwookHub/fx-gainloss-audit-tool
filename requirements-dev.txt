@@ -1,1 +1,2 @@
 pytest>=7.4
+Pillow>=10.0  # scripts/generate_readme_screenshots.py 전용 (파이프라인 본체는 사용 안 함)

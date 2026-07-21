@@ -1,29 +1,45 @@
 # -*- coding: utf-8 -*-
 """
 외환차손익/외화환산손익 검증 도구 설계용 샘플 데이터 생성기
-- 분개장.xlsx, 명세서(외화자산부채명세서).xlsx, 계정별원장.xlsx 3종 생성
-- 8개 거래(TXN001~TXN008)에 실현/미실현, 정상/오류 케이스를 섞어 놓음
+- 분개장.xlsx, 명세서(외화자산부채명세서).xlsx, 계정별원장.xlsx 3종을 sample_data/에 생성
+- 14개 거래(TXN001~TXN014)에 실현/미실현, 정상/오류, 분할결제, 신규 통화(GBP/HKD/CHF/CAD/
+  AUD/SGD), 2단계 증빙 OCR 케이스를 섞어 놓음 (TXN001~008은 기존 그대로 유지)
 - 결산일: 2025-12-31 (12월 결산법인 가정)
+- evidence/TXN011.png, evidence/TXN013.png도 함께 생성 (2단계 OCR 검증용 합성 증빙 이미지)
 """
+
+import os
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from PIL import Image, ImageDraw, ImageFont
 
 FONT_NAME = "Arial"
 HEADER_FILL = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 BOLD = Font(name=FONT_NAME, bold=True)
 NORMAL = Font(name=FONT_NAME)
 
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+SAMPLE_DIR = os.path.join(REPO_ROOT, "sample_data")
+EVIDENCE_DIR = os.path.join(REPO_ROOT, "evidence")
+
 # ------------------------------------------------------------------
-# 거래 마스터 데이터 (8건) - 여기서 한 번만 정의하고 3개 파일에서 재사용
+# 거래 마스터 데이터 - 여기서 한 번만 정의하고 3개 파일에서 재사용
 # ------------------------------------------------------------------
 # 각 거래: 거래ID, 거래처, 통화, 계정성격(채권/채무), 계정과목,
 #          발생일, 발생외화금액, 발생적용환율,
-#          결제일(None=기말 미결제), 결제적용환율(None 가능),
+#          결제일(None=기말 미결제), 결제적용환율(None 가능) - 또는 분할결제면 settle_events,
 #          기말재평가여부, 기말재평가적용환율(None 가능),
 #          비고(참고용 - 의도된 오류 설명, 실제 회사 파일에는 없는 내용이므로
 #              분개장/명세서에는 넣지 않고 별도 참고 시트에만 기록)
+#
+# settle_events: 분할결제 전용 필드. [{"date":..., "fc":..., "rate":...}, ...] 형태로 주면
+#   settle_date/settle_rate 대신 이걸 써서 결제일마다 별도 이벤트로 나눠 처리한다(각 회차는
+#   원래 채권/채무 장부가를 결제 외화금액 비중만큼 안분해서 상계).
+# evidence: 2단계 증빙 OCR 케이스 전용 필드. {"ocr_rate": ...}를 주면 evidence/{거래ID}.png를
+#   합성 생성한다 - ocr_rate가 회사 계상 환율(내재환율)과 같으면 "적정", 다르면 "불일치"로
+#   최종판정이 갈린다(verify_with_evidence의 0.1% 허용오차 비교 로직 기준).
 
 TXNS = [
     dict(id="TXN001", partner="ABC Trading", currency="USD", side="채권",
@@ -87,6 +103,61 @@ TXNS = [
          yearend=True, yearend_rate=1470.00,  # 오류: 실제 당기말(1434.90) 대신 전기말(2024-12-31) 환율을 잘못 사용
          note="오류 케이스 - 기말 재평가 시 당기말 환율(1434.90)이 아닌 전기말 환율(1470.00)을 잘못 사용해 "
               "외화환산이익을 과대계상(1,159,500원 vs 정상 633,000원)"),
+
+    # --- 여기부터 신규 (TXN009~014): 분할결제, 신규 통화, 2단계 증빙 OCR 케이스 ---
+
+    dict(id="TXN009", partner="Highland Textiles Ltd", currency="GBP", side="채권",
+         account="108 외상매출금(외화)", counter_account="401 매출",
+         occur_date="2025-01-15", occur_fc=8000, occur_rate=1892.40,
+         settle_events=[
+             {"date": "2025-03-10", "fc": 4000, "rate": 1885.60},
+             {"date": "2025-05-20", "fc": 4000, "rate": 1901.30},
+         ],
+         yearend=False, yearend_rate=None,
+         note="정상 케이스 - GBP, 한 거래를 두 번(2025-03-10 / 2025-05-20)에 나눠 결제했고 "
+              "각 회차 모두 실제 환율대로 정확히 반영됨(분할결제 처리 검증용)"),
+
+    dict(id="TXN010", partner="Kowloon Freight Co", currency="HKD", side="채무",
+         account="251 외상매입금(외화)", counter_account="146 원재료매입",
+         occur_date="2025-02-20", occur_fc=200000, occur_rate=184.90,
+         settle_date=None, settle_rate=None,
+         yearend=True, yearend_rate=183.50,
+         note="정상 케이스 - HKD, 기말 미결제 상태에서 실제 결산일 환율로 정확히 재평가됨"
+              "(신규 통화 HKD 검증용)"),
+
+    dict(id="TXN011", partner="Alpine Precision AG", currency="CHF", side="채권",
+         account="108 외상매출금(외화)", counter_account="401 매출",
+         occur_date="2025-03-25", occur_fc=6000, occur_rate=1620.50,
+         settle_date="2025-06-05", settle_rate=1750.00,  # 은행 전신환매매율(우대환율) 적용 - 매매기준율과 괴리 큼
+         yearend=False, yearend_rate=None,
+         evidence={"ocr_rate": 1750.00, "bank": "KEB Hana Bank", "doc": "외화예금 거래명세표"},
+         note="정상 케이스 - CHF, 1차 스크리닝에서는 매매기준율 대비 괴리가 커서(약 8%) 이상치로 "
+              "걸리지만, 실제로는 은행 전신환매매율(우대환율)을 정상 적용한 것으로 2단계 증빙 OCR을 "
+              "통해 적정으로 확인됨(false positive가 해소되는 사례)"),
+
+    dict(id="TXN012", partner="Maple Ridge Supplies", currency="CAD", side="채무",
+         account="251 외상매입금(외화)", counter_account="146 원재료매입",
+         occur_date="2025-04-10", occur_fc=15000, occur_rate=1015.80,
+         settle_date="2025-07-02", settle_rate=1008.40,
+         yearend=False, yearend_rate=None,
+         note="정상 케이스 - CAD, 실제 환율 그대로 정확히 계상됨(신규 통화 CAD 검증용)"),
+
+    dict(id="TXN013", partner="Outback Mining Corp", currency="AUD", side="채권",
+         account="108 외상매출금(외화)", counter_account="401 매출",
+         occur_date="2025-05-08", occur_fc=25000, occur_rate=915.60,
+         settle_date="2025-08-14", settle_rate=980.00,  # 오류: 자릿수/오기재로 실제보다 높게 잘못 적용
+         yearend=False, yearend_rate=None,
+         evidence={"ocr_rate": 918.75, "bank": "Woori Bank", "doc": "외환거래확인서"},
+         note="오류 케이스 - AUD, 결제 시 실제 환율(918.75)이 아닌 잘못된 환율(980.00)을 적용했고, "
+              "2단계 증빙(은행 외환거래확인서) OCR로도 불일치가 재확인됨"),
+
+    dict(id="TXN014", partner="Marina Bay Logistics", currency="SGD", side="채무",
+         account="251 외상매입금(외화)", counter_account="146 원재료매입",
+         occur_date="2025-06-18", occur_fc=12000, occur_rate=1078.30,
+         settle_date=None, settle_rate=None,
+         yearend=True, yearend_rate=1065.90,
+         note="정상 케이스 - SGD, 기말 미결제 상태에서 실제 결산일 환율로 정확히 재평가됨"
+              "(신규 통화 SGD 검증용)"),
 ]
 
 FX_ACCOUNT_MAP = {
@@ -141,8 +212,50 @@ def build_journal():
                        t["partner"], f"{t['partner']} 외상매입금 발생"])
         row += 2
 
-        # --- 결제 전표 (실현손익 있는 경우) ---
-        if t["settle_date"]:
+        # --- 결제 전표: 분할결제(settle_events) 또는 단일결제(settle_date) ---
+        if t.get("settle_events"):
+            for ev_idx, ev in enumerate(t["settle_events"], start=1):
+                ev_fc, ev_rate, ev_date = ev["fc"], ev["rate"], ev["date"]
+                leg_occur_krw = round(occur_krw * (ev_fc / t["occur_fc"]))
+                settle_krw = krw(ev_fc, ev_rate, is_jpy)
+                diff = settle_krw - leg_occur_krw
+                if t["side"] == "채권":
+                    ws.append([t["id"], f"3-{ev_idx}", ev_date, "결제", "103", "외화예금",
+                               settle_krw, "", t["currency"], ev_fc, ev_rate,
+                               t["partner"], f"{t['partner']} 대금 회수({ev_idx}차)"])
+                    ws.append([t["id"], f"4-{ev_idx}", ev_date, "결제", acct_code, acct_name,
+                               "", leg_occur_krw, t["currency"], ev_fc, t["occur_rate"],
+                               t["partner"], f"{t['partner']} 채권 일부 상계({ev_idx}차)"])
+                    if diff != 0:
+                        gain_acct = ("907", "외환차익") if diff > 0 else ("957", "외환차손")
+                        label = "외환차익" if diff > 0 else "외환차손"
+                        if diff > 0:
+                            ws.append([t["id"], f"5-{ev_idx}", ev_date, "결제", gain_acct[0], gain_acct[1],
+                                       "", abs(diff), t["currency"], "", "", t["partner"],
+                                       f"{t['partner']} {label} 인식({ev_idx}차)"])
+                        else:
+                            ws.append([t["id"], f"5-{ev_idx}", ev_date, "결제", gain_acct[0], gain_acct[1],
+                                       abs(diff), "", t["currency"], "", "", t["partner"],
+                                       f"{t['partner']} {label} 인식({ev_idx}차)"])
+                else:  # 채무 분할결제
+                    ws.append([t["id"], f"3-{ev_idx}", ev_date, "결제", acct_code, acct_name,
+                               leg_occur_krw, "", t["currency"], ev_fc, t["occur_rate"],
+                               t["partner"], f"{t['partner']} 채무 일부 상계({ev_idx}차)"])
+                    ws.append([t["id"], f"4-{ev_idx}", ev_date, "결제", "103", "외화예금",
+                               "", settle_krw, t["currency"], ev_fc, ev_rate,
+                               t["partner"], f"{t['partner']} 대금 지급({ev_idx}차)"])
+                    diff_liab = settle_krw - leg_occur_krw
+                    if diff_liab != 0:
+                        if diff_liab > 0:
+                            ws.append([t["id"], f"5-{ev_idx}", ev_date, "결제", "957", "외환차손",
+                                       abs(diff_liab), "", t["currency"], "", "", t["partner"],
+                                       f"{t['partner']} 외환차손 인식({ev_idx}차)"])
+                        else:
+                            ws.append([t["id"], f"5-{ev_idx}", ev_date, "결제", "907", "외환차익",
+                                       "", abs(diff_liab), t["currency"], "", "", t["partner"],
+                                       f"{t['partner']} 외환차익 인식({ev_idx}차)"])
+
+        elif t["settle_date"]:
             if t.get("settle_raw_no_divide"):
                 # 오류 재현: 100엔당 고시값을 그대로 1엔당인 것처럼 곱함 (100 나누기 누락)
                 settle_krw = round(t["occur_fc"] * t["settle_rate"])
@@ -211,7 +324,24 @@ def build_journal():
                         ws.append([t["id"], 4, "2025-12-31", "기말평가", acct_code, acct_name,
                                    "", abs(ye_diff), t["currency"], t["occur_fc"], t["yearend_rate"],
                                    t["partner"], f"{t['partner']} 외화환산손실 인식"])
-            # 채무 기말평가는 이번 샘플엔 없음(TXN007이 재평가 누락 케이스)
+            else:  # 채무 기말평가 (TXN010, TXN014)
+                if ye_diff != 0:
+                    if ye_diff > 0:
+                        # 부채 평가액 증가 = 환산손실
+                        ws.append([t["id"], 3, "2025-12-31", "기말평가", "958", "외화환산손실",
+                                   abs(ye_diff), "", t["currency"], "", "", t["partner"],
+                                   f"{t['partner']} 외화환산손실 인식"])
+                        ws.append([t["id"], 4, "2025-12-31", "기말평가", acct_code, acct_name,
+                                   "", abs(ye_diff), t["currency"], t["occur_fc"], t["yearend_rate"],
+                                   t["partner"], f"{t['partner']} 외화환산손실 인식"])
+                    else:
+                        # 부채 평가액 감소 = 환산이익
+                        ws.append([t["id"], 3, "2025-12-31", "기말평가", acct_code, acct_name,
+                                   abs(ye_diff), "", t["currency"], t["occur_fc"], t["yearend_rate"],
+                                   t["partner"], f"{t['partner']} 외화환산이익 인식"])
+                        ws.append([t["id"], 4, "2025-12-31", "기말평가", "908", "외화환산이익",
+                                   "", abs(ye_diff), t["currency"], "", "", t["partner"],
+                                   f"{t['partner']} 외화환산이익 인식"])
 
     for col in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(col)].width = 16
@@ -242,6 +372,20 @@ def build_schedule():
     for t in TXNS:
         is_jpy = t["currency"] == "JPY"
         occur_krw = krw(t["occur_fc"], t["occur_rate"], is_jpy)
+
+        if t.get("settle_events"):
+            # 분할결제: 회차별로 한 행씩 (messy_명세서_...xlsx의 TXN102 처리 방식과 동일 관례)
+            for ev_idx, ev in enumerate(t["settle_events"], start=1):
+                settle_krw = krw(ev["fc"], ev["rate"], is_jpy)
+                note = f"분할결제 {ev_idx}차"
+                ws.append([
+                    t["id"], t["partner"], t["currency"], t["side"], t["account"],
+                    t["occur_date"], t["occur_fc"], t["occur_rate"], occur_krw,
+                    ev["date"], ev["fc"], ev["rate"], settle_krw,
+                    0, note,
+                ])
+            continue
+
         if t["settle_date"]:
             if t.get("settle_raw_no_divide"):
                 settle_krw = round(t["occur_fc"] * t["settle_rate"])
@@ -304,7 +448,27 @@ def build_ledger():
             add(counter, counter, occur_krw, 0)
             add(acct, acct, 0, occur_krw)
 
-        if t["settle_date"]:
+        if t.get("settle_events"):
+            for ev in t["settle_events"]:
+                leg_occur_krw = round(occur_krw * (ev["fc"] / t["occur_fc"]))
+                settle_krw = krw(ev["fc"], ev["rate"], is_jpy)
+                diff = settle_krw - leg_occur_krw
+                if t["side"] == "채권":
+                    add("103 외화예금", "103 외화예금", settle_krw, 0)
+                    add(acct, acct, 0, leg_occur_krw)
+                    if diff > 0:
+                        add("907 외환차익", "907 외환차익", 0, diff)
+                    elif diff < 0:
+                        add("957 외환차손", "957 외환차손", abs(diff), 0)
+                else:
+                    add(acct, acct, leg_occur_krw, 0)
+                    add("103 외화예금", "103 외화예금", 0, settle_krw)
+                    if diff > 0:
+                        add("957 외환차손", "957 외환차손", abs(diff), 0)
+                    elif diff < 0:
+                        add("907 외환차익", "907 외환차익", 0, abs(diff))
+
+        elif t["settle_date"]:
             if t.get("settle_raw_no_divide"):
                 settle_krw = round(t["occur_fc"] * t["settle_rate"])
             else:
@@ -332,15 +496,23 @@ def build_ledger():
         if t["yearend"]:
             ye_krw = krw(t["occur_fc"], t["yearend_rate"], is_jpy)
             ye_diff = ye_krw - occur_krw
-            if t["side"] == "채권" and ye_diff != 0:
-                if ye_diff > 0:
-                    add(acct, acct, abs(ye_diff), 0)
-                    add("908 외화환산이익", "908 외화환산이익", 0, abs(ye_diff))
-                else:
-                    add("958 외화환산손실", "958 외화환산손실", abs(ye_diff), 0)
-                    add(acct, acct, 0, abs(ye_diff))
+            if ye_diff != 0:
+                if t["side"] == "채권":
+                    if ye_diff > 0:
+                        add(acct, acct, abs(ye_diff), 0)
+                        add("908 외화환산이익", "908 외화환산이익", 0, abs(ye_diff))
+                    else:
+                        add("958 외화환산손실", "958 외화환산손실", abs(ye_diff), 0)
+                        add(acct, acct, 0, abs(ye_diff))
+                else:  # 채무 기말평가 (TXN010, TXN014)
+                    if ye_diff > 0:
+                        add("958 외화환산손실", "958 외화환산손실", abs(ye_diff), 0)
+                        add(acct, acct, 0, abs(ye_diff))
+                    else:
+                        add(acct, acct, abs(ye_diff), 0)
+                        add("908 외화환산이익", "908 외화환산이익", 0, abs(ye_diff))
 
-    # 기초잔액 (전기이월 - 8건 거래와 무관한 별도 잔액, 실무 반영을 위해 가정)
+    # 기초잔액 (전기이월 - 거래와 무관한 별도 잔액, 실무 반영을 위해 가정)
     opening = {
         ("103", "외화예금"): 50000000,
         ("108", "외상매출금(외화)"): 12000000,
@@ -378,7 +550,7 @@ def build_ledger():
 
 
 # ------------------------------------------------------------------
-# 4. 참고용 시트(검증 포인트 정리) - 실제 회사 파일에는 없는, 성욱님 검토용
+# 4. 참고용 시트(검증 포인트 정리) - 실제 회사 파일에는 없는, 검토용
 # ------------------------------------------------------------------
 
 def build_answer_key():
@@ -392,7 +564,7 @@ def build_answer_key():
         cell.fill = HEADER_FILL
 
     for t in TXNS:
-        유형 = "기말 미실현(외화환산)" if t["yearend"] or (not t["settle_date"] and not t["yearend"]) else "실현(결제완료)"
+        유형 = "기말 미실현(외화환산)" if t.get("yearend") else "실현(결제완료)"
         정상오류 = "오류" if "오류" in t["note"] else "정상"
         ws.append([t["id"], 유형, 정상오류, t["note"]])
 
@@ -407,9 +579,83 @@ def build_answer_key():
     return wb
 
 
+# ------------------------------------------------------------------
+# 5. 2단계 증빙 OCR 검증용 합성 증빙 이미지 (evidence/{거래ID}.png)
+# ------------------------------------------------------------------
+
+def _ocr_font(size: int, bold: bool = False):
+    candidates = (["malgunbd.ttf", "malgun.ttf"] if bold else ["malgun.ttf"]) + \
+                 ["arialbd.ttf" if bold else "arial.ttf"]
+    for name in candidates:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _build_evidence_image(txn: dict, out_path: str) -> None:
+    """tests/generate_ocr_test_sample.py와 동일한 방식(PIL 합성 은행 확인서)으로
+    evidence/{거래ID}.png를 만든다. ocr_rate가 곧 Claude Vision이 추출해야 할 정답값."""
+    ev = txn["evidence"]
+    ground_truth = {
+        "거래일자": txn["settle_date"],
+        "통화": txn["currency"],
+        "적용환율": ev["ocr_rate"],
+        "외화금액": float(txn["occur_fc"]),
+        "원화금액": round(txn["occur_fc"] * ev["ocr_rate"]),
+    }
+
+    width, height = 900, 640
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([4, 4, width - 5, height - 5], outline="black", width=2)
+
+    bank = ev.get("bank", "은행")
+    doc = ev.get("doc", "외환거래확인서")
+    draw.text((40, 30), bank, font=_ocr_font(26, bold=True), fill="black")
+    draw.text((40, 66), f"{doc} (Foreign Exchange Deal Confirmation)",
+              font=_ocr_font(15), fill="black")
+    draw.line([(40, 98), (width - 40, 98)], fill="black", width=1)
+
+    rows = [
+        ("거래번호 (Deal No.)", f"FX-{txn['id']}-CONF"),
+        ("거래일자 (Trade Date)", ground_truth["거래일자"]),
+        ("고객명 (Customer)", "(주)당사"),
+        ("상대처 (Counterparty)", txn["partner"]),
+        ("통화 (Currency)", ground_truth["통화"]),
+        ("외화금액 (FC Amount)", f"{ground_truth['외화금액']:,.2f}"),
+        ("적용환율 (Applied Rate)", f"{ground_truth['적용환율']:,.2f}"),
+        ("원화금액 (KRW Amount)", f"{ground_truth['원화금액']:,}"),
+    ]
+    y = 128
+    for label, value in rows:
+        draw.text((40, y), label, font=_ocr_font(15), fill="black")
+        draw.text((420, y), str(value), font=_ocr_font(15, bold=True), fill="black")
+        y += 45
+
+    draw.line([(40, y + 10), (width - 40, y + 10)], fill="black", width=1)
+    draw.text((40, y + 30), "본 확인서는 당행 외환거래 시스템에서 발급된 정식 문서입니다.",
+              font=_ocr_font(13), fill="black")
+    draw.text((40, y + 55), f"{bank} Foreign Exchange Center", font=_ocr_font(13), fill="gray")
+
+    img.save(out_path)
+
+
+def build_evidence_images():
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    for t in TXNS:
+        if t.get("evidence"):
+            out_path = os.path.join(EVIDENCE_DIR, f"{t['id']}.png")
+            _build_evidence_image(t, out_path)
+            print(f"증빙 이미지 생성 완료: {out_path}")
+
+
 if __name__ == "__main__":
-    build_journal().save("분개장.xlsx")
-    build_schedule().save("명세서_외화자산부채명세서.xlsx")
-    build_ledger().save("계정별원장.xlsx")
-    build_answer_key().save("검증포인트_참고용.xlsx")
+    os.makedirs(SAMPLE_DIR, exist_ok=True)
+    build_journal().save(os.path.join(SAMPLE_DIR, "분개장.xlsx"))
+    build_schedule().save(os.path.join(SAMPLE_DIR, "명세서_외화자산부채명세서.xlsx"))
+    build_ledger().save(os.path.join(SAMPLE_DIR, "계정별원장.xlsx"))
+    build_answer_key().save(os.path.join(SAMPLE_DIR, "검증포인트_참고용.xlsx"))
+    build_evidence_images()
     print("생성 완료")

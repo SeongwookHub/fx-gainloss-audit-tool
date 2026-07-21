@@ -22,15 +22,23 @@
   2. 증빙 이미지가 있다면 evidence/ 폴더에 "{거래ID}.png" 또는 "{거래ID}.jpg" 형태로 저장
      (예: evidence/TXN002.png) - 없으면 2단계는 "증빙 요청 필요"로 표시만 하고 넘어감
   3. Claude API 사용을 위해 ANTHROPIC_API_KEY 환경변수 설정 (2단계 OCR용)
-  4. pip install anthropic pandas openpyxl requests --break-system-packages
+  4. pip install -r requirements.txt (anthropic, pandas, openpyxl, requests, python-docx)
+
+[실행]
+  인자 없이 실행하면 sample_data/의 샘플 분개장·명세서·계정별원장을 대상으로 동작한다.
+  --journal/--schedule/--ledger/--year-end-date/--output/--ampt로 실제 파일과 결산일을
+  지정할 수 있다 (python fx_verification_pipeline.py --help 참고).
+  --workpaper를 주면 검증결과.xlsx와 함께 감사조서 형식의 Word 문서(기본
+  감사조서_외환차손익.docx, --workpaper-output으로 경로 변경 가능)도 생성한다.
 """
 
 import os
+import sys
 import re
 import json
 import time
 import math
-import random
+import hashlib
 import base64
 import argparse
 from datetime import datetime, timedelta
@@ -40,6 +48,14 @@ import requests
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+from dotenv import load_dotenv
+
+load_dotenv()  # 스크립트와 같은 폴더의 .env 파일에서 EXIM_AUTH_KEY/ANTHROPIC_API_KEY 등을 읽어옴
+
+# Windows 콘솔 기본 코드페이지(cp949)는 "↳" 등 일부 문자를 인코딩하지 못해 print()가 죽으므로 stdout/stderr를 UTF-8로 고정
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8")
 
 # ------------------------------------------------------------------
 # 0. 설정
@@ -54,10 +70,15 @@ TOLERANCE_PCT = 0.05          # 1단계 이상치 판단 기준: 괴리율 5%
 GAIN_LOSS_TOLERANCE_KRW = 1000  # 재계산 금액과 회사 계상액의 허용 오차(원 단위 반올림 차이)
 AMPT = float(os.environ.get("FX_AMPT", 3000000))  # 허용가능 오류금액(Tolerable Misstatement) - 감사팀 산정치로 교체
 
+AR_ACCOUNT_CODE = "108"  # 외상매출금(채권)
+AP_ACCOUNT_CODE = "251"  # 외상매입금(채무)
+
 # 2단계 OCR이 "적정(증빙과 일치)"로 판정한 건 중 일부를 QC 표본으로 재확인하기 위한 비율.
 # 거래 자체가 아니라 OCR 판정 로직의 신뢰성(위음성 여부)을 점검하는 목적.
 OCR_RECHECK_SAMPLE_RATE = float(os.environ.get("FX_OCR_RECHECK_RATE", 0.15))
-OCR_RECHECK_SAMPLE_SEED = 42  # 같은 입력이면 같은 표본이 뽑히도록 고정 (감사조서 재현성)
+# 거래ID를 해시하는 솔트값. random 모듈의 전역/지역 시드가 아니라 거래ID 자체를 해시하므로,
+# 매칭된 행의 순서나 개수가 달라져도(다른 기능 추가 등) 이미 뽑힌 거래ID의 표본 여부는 안 바뀐다.
+OCR_RECHECK_SAMPLE_SEED = 42
 
 CUR_UNIT_MAP = {
     "USD": "USD", "JPY": "JPY(100)", "EUR": "EUR", "CNH": "CNH", "CNY": "CNH",
@@ -242,8 +263,8 @@ def extract_settlement_transactions(journal_df: pd.DataFrame) -> pd.DataFrame:
         # 채권/채무 구분 - 거래ID 전체의 발생 라인 기준 (분할결제라도 발생은 1건)
         occur_rows = journal_df[(journal_df["전표번호(거래ID)"] == txn_id) &
                                  (journal_df["구분"] == "발생") &
-                                 (journal_df["계정코드"].isin(["108", "251"]))]
-        side = "채권" if not occur_rows.empty and occur_rows.iloc[0]["계정코드"] == "108" else "채무"
+                                 (journal_df["계정코드"].isin([AR_ACCOUNT_CODE, AP_ACCOUNT_CODE]))]
+        side = "채권" if not occur_rows.empty and occur_rows.iloc[0]["계정코드"] == AR_ACCOUNT_CODE else "채무"
 
         # 데이터 무결성 경고: 같은 거래ID인데 통화나 거래처가 서로 다른 '발생' 라인이
         # 여러 개 섞여 있으면, 전표번호가 중복 채번되어 서로 다른 거래가 합쳐졌을 가능성이
@@ -336,6 +357,18 @@ def screen_fx_settlements(settlements: pd.DataFrame) -> pd.DataFrame:
     results = []
     for _, row in settlements.iterrows():
         cur_unit, cur_warning = resolve_cur_unit(row["통화"])
+        if cur_warning:
+            # 통화코드가 CUR_UNIT_MAP에 없으면 API가 우연히 받아줄 수도 있는 값을 그대로
+            # 조회하지 않고, detect_reference_date_mismatch/verify_yearend_translation과
+            # 동일하게 조회 자체를 건너뛰고 확인불가로 남긴다.
+            results.append({
+                **row.to_dict(),
+                "공식매매기준율": None, "공식환율기준일": None, "괴리율(%)": None,
+                "1차플래그": f"확인불가({cur_warning})",
+                "재계산_외환차손익(공식환율기준)": None, "회사계상액과의차이(KRW)": None,
+                "비고": cur_warning,
+            })
+            continue
         try:
             official_raw, actual_date = get_official_rate(row["결제일"], cur_unit)
         except ValueError as e:
@@ -624,18 +657,27 @@ def extract_rate_from_evidence(image_path: str) -> dict:
         return {"error": "JSON 파싱 실패", "raw_text": raw_text}
 
 
+def _ocr_recheck_hash_key(transaction_id, seed: int) -> str:
+    """거래ID를 sha256으로 해시해 정렬 키를 만든다. 내장 hash()는 PYTHONHASHSEED에 따라
+    실행마다 값이 달라져 재현성이 깨지므로 쓰지 않는다."""
+    return hashlib.sha256(f"{seed}:{transaction_id}".encode("utf-8")).hexdigest()
+
+
 def _select_ocr_recheck_sample(rows: list) -> None:
     """OCR이 '적정(증빙과 일치)'로 판정한 행 중 일부를 골라 'OCR재확인표본' 플래그를 붙인다.
     '불일치' 판정 건은 이미 Exception으로 전수 확인 대상이 되므로 손대지 않는다 - 여기서
     보는 것은 거래 자체의 적정성이 아니라, OCR이 실제로는 불일치인데 일치로 오판(위음성)하지
-    않았는지를 감사인이 표본으로 재확인하기 위한 QC 절차다. 고정 시드를 써서 같은 입력이면
-    같은 표본이 뽑히도록 한다(감사조서 재현성). 문구는 FLAG_KEYWORDS와 겹치지 않게 골라
-    Exception 하이라이트에 섞이지 않도록 한다."""
+    않았는지를 감사인이 표본으로 재확인하기 위한 QC 절차다. 거래ID를 해시해 순위를 매기고
+    상위 N개를 뽑는다(거래ID 기반 고정) - random.Random(seed).sample()처럼 매칭된 행의
+    리스트 순서/구성에 기대는 방식이면, 다른 기능이 추가되어 순서나 건수가 달라질 때 이미
+    뽑혔던 거래ID의 표본 여부까지 흔들릴 수 있어 피한다. 문구는 FLAG_KEYWORDS와 겹치지
+    않게 골라 Exception 하이라이트에 섞이지 않도록 한다."""
     matched = [r for r in rows if r.get("최종판정") == "적정(증빙과 일치)"]
     sampled_ids = set()
     if matched:
         sample_size = min(len(matched), max(1, math.ceil(len(matched) * OCR_RECHECK_SAMPLE_RATE)))
-        sampled_ids = {id(r) for r in random.Random(OCR_RECHECK_SAMPLE_SEED).sample(matched, sample_size)}
+        ranked = sorted(matched, key=lambda r: _ocr_recheck_hash_key(r.get("거래ID"), OCR_RECHECK_SAMPLE_SEED))
+        sampled_ids = {id(r) for r in ranked[:sample_size]}
     # 매칭된 행이 0건이어도 컬럼 자체는 항상 채워야, 호출부가 dtype/컬럼 접근 시 KeyError가 안 난다.
     for r in rows:
         r["OCR재확인표본"] = "재확인 대상(QC 표본)" if id(r) in sampled_ids else None
@@ -724,7 +766,7 @@ def verify_yearend_translation(ye_df: pd.DataFrame, missing_df: pd.DataFrame, ye
             rows.append({**row.to_dict(), "공식결산환율": None, "일치여부": f"확인불가(환율조회실패: {e})"})
             continue
         official_rate = normalize_rate(official_raw, row["통화"])
-        company_rate = normalize_rate(row["회사적용환율(기말)"], row["통화"]) if row["통화"] == "JPY" else row["회사적용환율(기말)"]
+        company_rate = normalize_rate(row["회사적용환율(기말)"], row["통화"])
 
         rate_match = abs(company_rate - official_rate) <= official_rate * 0.001
         rows.append({
@@ -810,8 +852,8 @@ def verify_ledger_reconciliation(journal_df: pd.DataFrame, ledger_df: pd.DataFra
 # 확인이 끝난 매핑표는 이후 전 회계기간에 재사용 가능하다.
 
 FX_ACCOUNT_KEYWORDS = {
-    "108": (["외상매출금", "매출채권", "수출채권", "AR"], ["외화", "외환", "FX", "USD", "EUR", "JPY"]),
-    "251": (["외상매입금", "매입채무", "수입채무", "AP"], ["외화", "외환", "FX", "USD", "EUR", "JPY"]),
+    AR_ACCOUNT_CODE: (["외상매출금", "매출채권", "수출채권", "AR"], ["외화", "외환", "FX", "USD", "EUR", "JPY"]),
+    AP_ACCOUNT_CODE: (["외상매입금", "매입채무", "수입채무", "AP"], ["외화", "외환", "FX", "USD", "EUR", "JPY"]),
     "103": (["외화예금", "외환예금"], []),
     "907": (["외환차익", "환차익", "외화차익", "FX GAIN", "FX 차익"], []),
     "957": (["외환차손", "환차손", "외화차손", "FX LOSS", "FX 차손"], []),
@@ -819,7 +861,7 @@ FX_ACCOUNT_KEYWORDS = {
     "958": (["외화환산손실", "환산손실", "외화평가손실", "FX TRANSLATION LOSS"], []),
 }
 STANDARD_ACCOUNT_NAME = {
-    "108": "외상매출금(외화)", "251": "외상매입금(외화)", "103": "외화예금",
+    AR_ACCOUNT_CODE: "외상매출금(외화)", AP_ACCOUNT_CODE: "외상매입금(외화)", "103": "외화예금",
     "907": "외환차익", "957": "외환차손", "908": "외화환산이익", "958": "외화환산손실",
 }
 
@@ -935,10 +977,10 @@ def build_rollforward_verification(journal_df: pd.DataFrame, schedule_df: pd.Dat
 
     def _signed_amount(row) -> float:
         amt = row[["차변금액", "대변금액"]].fillna(0).abs().max()
-        return amt if row["계정코드"] == "108" else -amt
+        return amt if row["계정코드"] == AR_ACCOUNT_CODE else -amt
 
     occur_rows = journal_df[(journal_df["구분"] == "발생") &
-                             (journal_df["계정코드"].isin(["108", "251"]))].copy()
+                             (journal_df["계정코드"].isin([AR_ACCOUNT_CODE, AP_ACCOUNT_CODE]))].copy()
     occur_rows["_signed"] = occur_rows.apply(_signed_amount, axis=1)
     occur_by_partner = occur_rows.groupby(["거래처", "통화"])["_signed"].sum()
 
